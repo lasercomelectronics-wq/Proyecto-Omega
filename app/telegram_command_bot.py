@@ -27,12 +27,18 @@ from app.strategy_engine import (
     analyze_sqzmom,
     evaluate_signal_quality,
 )
+from app.structure import analyze_structure
 from app.trade_manager import TradeManager
+from app.storage import Storage
+from app.scanner import evaluate_auto_alert_gate
+from app.trade_planner import evaluate_plan_gate
 
-MessageSender = Callable[[str, str], Awaitable[None]]
+MessageSender = Callable[..., Awaitable[None]]
 StatusProvider = Callable[[], dict[str, Any]]
 TradeChangeCallback = Callable[[str | None], Awaitable[None]]
 CurrentPriceProvider = Callable[[str], Awaitable[tuple[float, str, int | None] | None]]
+PlanBuilder = Callable[..., Awaitable[int | None]]
+ScannerStateProvider = Callable[[], dict[str, dict[str, object]]]
 
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,20}$")
 TIMEFRAME_PATTERN = re.compile(r"^\d+[mhdwM]$", re.IGNORECASE)
@@ -78,6 +84,28 @@ class TelegramCommandBot:
         timeout_seconds: float = 15.0,
         polling_timeout_seconds: int = 20,
         sender: MessageSender | None = None,
+        storage: Storage | None = None,
+        plan_builder: PlanBuilder | None = None,
+        plan_expire_minutes: int = 120,
+        plan_use_fib: bool = True,
+        plan_use_order_blocks: bool = True,
+        plan_min_rr_tp1: float = 1.0,
+        plan_atr_buffer_mult: float = 0.25,
+        structure_enabled: bool = True,
+        structure_timeframes: tuple[str, ...] = ("15m", "5m", "3m"),
+        pivot_window: int = 3,
+        pullback_tolerance_mode: str = "atr",
+        pullback_atr_mult: float = 0.25,
+        pullback_pct: float = 0.15,
+        scanner_alert_low_quality: bool = False,
+        scanner_alert_momentum_chase: bool = False,
+        scanner_min_quality: str = "MEDIA",
+        scanner_require_adx_not_weak: bool = True,
+        scanner_require_structure_confirmation: bool = False,
+        scanner_block_dry_volume: bool = True,
+        scanner_state_provider: ScannerStateProvider | None = None,
+        plan_monitor_enabled: bool = True,
+        plan_monitor_interval_seconds: int = 15,
     ) -> None:
         if not bot_token:
             raise TelegramCommandBotError("TELEGRAM_BOT_TOKEN no configurado.")
@@ -94,6 +122,28 @@ class TelegramCommandBot:
         self._on_trade_changed = on_trade_changed
         self._polling_timeout_seconds = polling_timeout_seconds
         self._sender_override = sender
+        self._storage = storage
+        self._plan_builder = plan_builder
+        self._plan_expire_minutes = plan_expire_minutes
+        self._plan_use_fib = plan_use_fib
+        self._plan_use_order_blocks = plan_use_order_blocks
+        self._plan_min_rr_tp1 = plan_min_rr_tp1
+        self._plan_atr_buffer_mult = plan_atr_buffer_mult
+        self._structure_enabled = structure_enabled
+        self._structure_timeframes = tuple(structure_timeframes)
+        self._pivot_window = max(2, int(pivot_window))
+        self._pullback_tolerance_mode = pullback_tolerance_mode
+        self._pullback_atr_mult = pullback_atr_mult
+        self._pullback_pct = pullback_pct
+        self._scanner_alert_low_quality = scanner_alert_low_quality
+        self._scanner_alert_momentum_chase = scanner_alert_momentum_chase
+        self._scanner_min_quality = scanner_min_quality
+        self._scanner_require_adx_not_weak = scanner_require_adx_not_weak
+        self._scanner_require_structure_confirmation = scanner_require_structure_confirmation
+        self._scanner_block_dry_volume = scanner_block_dry_volume
+        self._scanner_state_provider = scanner_state_provider or (lambda: {})
+        self._plan_monitor_enabled = plan_monitor_enabled
+        self._plan_monitor_interval_seconds = max(10, int(plan_monitor_interval_seconds))
         self._offset: int | None = None
         self._sessions: dict[str, ChatSession] = {}
         self._stop_event = asyncio.Event()
@@ -132,7 +182,7 @@ class TelegramCommandBot:
             params={
                 "timeout": self._polling_timeout_seconds,
                 "offset": self._offset,
-                "allowed_updates": '["message"]',
+                "allowed_updates": '["message","callback_query"]',
             },
         )
         data = response.json()
@@ -142,20 +192,34 @@ class TelegramCommandBot:
             )
         return list(data.get("result", []))
 
-    async def _send_message(self, chat_id: str, text: str) -> None:
+    async def _send_message(self, chat_id: str, text: str, reply_markup: dict[str, object] | None = None) -> None:
         if self._sender_override is not None:
-            await self._sender_override(str(chat_id), text)
+            try:
+                await self._sender_override(str(chat_id), text, reply_markup)
+            except TypeError:
+                await self._sender_override(str(chat_id), text)
             return
         assert self._client is not None
+        payload: dict[str, object] = {"chat_id": chat_id, "text": text}
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         response = await self._client.post(
             "/sendMessage",
-            json={"chat_id": chat_id, "text": text},
+            json=payload,
         )
         data = response.json()
         if response.status_code >= 400 or not data.get("ok", False):
             raise TelegramCommandBotError(
                 data.get("description", f"Telegram respondio con {response.status_code}")
             )
+
+    async def _answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
+        if self._client is None:
+            return
+        payload: dict[str, object] = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+        await self._client.post("/answerCallbackQuery", json=payload)
 
     async def _notify_trade_changed(self, symbol: str | None) -> None:
         if self._on_trade_changed is not None:
@@ -274,6 +338,11 @@ class TelegramCommandBot:
         return mark_price, "Binance Futures mark price (REST)", event_time
 
     async def handle_update(self, update: dict[str, Any]) -> None:
+        callback_query = update.get("callback_query")
+        if isinstance(callback_query, dict):
+            await self._handle_callback_query(callback_query)
+            return
+
         message = update.get("message") or {}
         chat = message.get("chat") or {}
         chat_id = str(chat.get("id", ""))
@@ -319,6 +388,7 @@ class TelegramCommandBot:
             "/start": self._handle_start,
             "/help": self._handle_help,
             "/comandos": self._handle_help,
+            "/menu": self._handle_menu,
             "/status": self._handle_status,
             "/trades": self._handle_trades,
             "/watchlist": self._handle_watchlist,
@@ -338,6 +408,12 @@ class TelegramCommandBot:
             "/consulta": self._handle_consulta,
             "/renderizar": self._handle_renderizar,
             "/signal": self._handle_signal,
+            "/debug_signal": self._handle_debug_signal,
+            "/debug": self._handle_debug_signal,
+            "/plan": self._handle_plan,
+            "/plans": self._handle_plans,
+            "/plan_status": self._handle_plan_status,
+            "/cancel_plan": self._handle_cancel_plan,
         }
         handler = handlers.get(command)
         if handler is None:
@@ -350,6 +426,54 @@ class TelegramCommandBot:
         except Exception as exc:
             self._logger.exception("Fallo inesperado manejando %s", command)
             await self._send_message(chat_id, f"No pude procesar {command}. Motivo: {exc}")
+
+    async def _handle_callback_query(self, callback_query: dict[str, Any]) -> None:
+        callback_id = str(callback_query.get("id", ""))
+        message = callback_query.get("message") or {}
+        chat_id = str((message.get("chat") or {}).get("id", ""))
+        data = str(callback_query.get("data", "") or "")
+        if not callback_id or not chat_id:
+            return
+        if chat_id != self._authorized_chat_id:
+            await self._answer_callback_query(callback_id, "Unauthorized")
+            return
+
+        await self._answer_callback_query(callback_id)
+        if data == "menu:watchlist":
+            await self._handle_watchlist(chat_id, "")
+            return
+        if data == "menu:scanner":
+            await self._send_message(chat_id, await self._scanner_panel_text())
+            return
+        if data == "menu:signals":
+            await self._send_signal_symbols_menu(chat_id)
+            return
+        if data.startswith("sig:"):
+            await self._send_message(chat_id, await self._signal_compact(data.split(":", 1)[1]))
+            return
+        if data.startswith("dbg:"):
+            await self._handle_debug_signal(chat_id, data.split(":", 1)[1])
+            return
+        if data == "menu:plans":
+            await self._send_plans_menu(chat_id)
+            return
+        if data.startswith("plansym:"):
+            await self._send_plans_for_symbol(chat_id, data.split(":", 1)[1])
+            return
+        if data.startswith("cancelplan:"):
+            await self._handle_cancel_plan(chat_id, data.split(":", 1)[1])
+            return
+        if data == "menu:monitor":
+            await self._send_message(chat_id, await self._monitor_panel_text())
+            return
+        if data == "menu:addpar":
+            await self._send_message(chat_id, "Usá:\n/add watchlist BTC\n/add watchlist ETHUSDT")
+            return
+        if data == "menu:removepar":
+            await self._send_message(chat_id, "Usá:\n/remove watchlist BTC")
+            return
+        if data == "menu:help":
+            await self._handle_help(chat_id, "")
 
     async def _handle_start(self, chat_id: str, _: str) -> None:
         status = self._status_provider()
@@ -375,6 +499,9 @@ class TelegramCommandBot:
                     "/consulta precio BTC",
                     "/renderizar BTCUSDT 1m",
                     "/signal BTC",
+                    "/debug_signal BTC",
+                    "/plan BTC",
+                    "/plans",
                     "",
                     "📡 Watchlist:",
                     "/watchlist",
@@ -409,6 +536,21 @@ class TelegramCommandBot:
                 ]
             ),
         )
+
+    async def _handle_menu(self, chat_id: str, _: str) -> None:
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "📡 Watchlist", "callback_data": "menu:watchlist"}],
+                [{"text": "📊 Scanner", "callback_data": "menu:scanner"}],
+                [{"text": "📈 Señales", "callback_data": "menu:signals"}],
+                [{"text": "🧭 Planes", "callback_data": "menu:plans"}],
+                [{"text": "🎯 TP/SL Monitor", "callback_data": "menu:monitor"}],
+                [{"text": "➕ Add Par", "callback_data": "menu:addpar"}],
+                [{"text": "➖ Remove Par", "callback_data": "menu:removepar"}],
+                [{"text": "❓ Help", "callback_data": "menu:help"}],
+            ]
+        }
+        await self._send_message(chat_id, "🤖 Trading Bot Panel", reply_markup=keyboard)
 
     async def _handle_status(self, chat_id: str, _: str) -> None:
         status = self._status_provider()
@@ -478,7 +620,137 @@ class TelegramCommandBot:
         lines.extend(f"- {item}" for item in WATCHLIST_INDICATORS)
         lines.extend(["", "Alertas:"])
         lines.extend(f"- {item}" for item in WATCHLIST_ALERT_RULES)
+        state = self._scanner_state_provider()
+        if state:
+            lines.extend(["", "Último scan:"])
+            for symbol in symbols:
+                symbol_state = state.get(symbol, {})
+                if not symbol_state:
+                    lines.append(f"- {symbol}: sin datos")
+                    continue
+                lines.append(
+                    f"- {symbol}: {symbol_state.get('scanned_at','-')} | {symbol_state.get('result_type','-')} | {symbol_state.get('block_reason','OK')}"
+                )
         await self._send_message(chat_id, "\n".join(lines))
+
+    async def _scanner_panel_text(self) -> str:
+        status = self._status_provider()
+        symbols = self._trade_manager.get_watchlist_symbols()
+        lines = [
+            "📊 Scanner",
+            f"Estado: {'ON' if str(status.get('SCANNER_ENABLED', 'false')).lower() == 'true' else 'OFF'}",
+            f"Alertas: {'ON' if str(status.get('SCANNER_ALERTS_ENABLED', 'false')).lower() == 'true' else 'OFF'}",
+            f"Intervalo: {status.get('SCANNER_INTERVAL_SECONDS', 60)}s",
+            f"Total pares: {len(symbols)}",
+        ]
+        state = self._scanner_state_provider()
+        if state:
+            lines.append("Último scan por par:")
+            for symbol in symbols:
+                item = state.get(symbol, {})
+                lines.append(f"- {symbol}: {item.get('result_type','-')} | reason={item.get('block_reason','OK')}")
+        return "\n".join(lines)
+
+    async def _send_signal_symbols_menu(self, chat_id: str) -> None:
+        symbols = self._trade_manager.get_watchlist_symbols()
+        if not symbols:
+            await self._send_message(chat_id, "No hay pares en watchlist.")
+            return
+        keyboard_rows = []
+        for symbol in symbols[:12]:
+            keyboard_rows.append(
+                [
+                    {"text": symbol, "callback_data": f"sig:{symbol}"},
+                    {"text": f"Debug {symbol}", "callback_data": f"dbg:{symbol}"},
+                ]
+            )
+        await self._send_message(chat_id, "📈 Elegí un par para señal:", reply_markup={"inline_keyboard": keyboard_rows})
+
+    async def _signal_compact(self, symbol: str) -> str:
+        if self._binance_client is None:
+            return "Cliente Binance no disponible."
+        normalized = self._normalize_futures_symbol(symbol)
+        _, quality, _ = await self._compute_signal_quality(normalized)
+        return "\n".join(
+            [
+                f"📈 {normalized}",
+                f"Tipo: {quality.get('signal_type','SIN_SEÑAL')}",
+                f"Side: {quality.get('result','SIN_SEÑAL')}",
+                f"Calidad: {quality.get('quality','BAJA')}",
+                f"Score: {quality.get('score_total', quality.get('score', 0))}",
+            ]
+        )
+
+    async def _send_plans_menu(self, chat_id: str) -> None:
+        if self._storage is None:
+            await self._send_message(chat_id, "Storage no disponible.")
+            return
+        plans = await self._storage.list_open_trade_plans()
+        planner_enabled = self._plan_builder is not None
+        if not plans:
+            await self._send_message(
+                chat_id,
+                "\n".join(
+                    [
+                    "🧭 Planes",
+                    f"Planner: {'ON' if planner_enabled else 'OFF'}",
+                    f"Monitor: {'ON' if self._plan_monitor_enabled else 'OFF'}",
+                    "Último error planner: n/a",
+                    "No hay planes abiertos.",
+                ]
+            ),
+            )
+            return
+        symbols = sorted({str(plan["symbol"]) for plan in plans})
+        rows = [[{"text": f"{symbol} plans", "callback_data": f"plansym:{symbol}"}] for symbol in symbols]
+        latest_by_symbol: dict[str, int] = {}
+        for plan in plans:
+            symbol = str(plan["symbol"])
+            latest_by_symbol[symbol] = max(latest_by_symbol.get(symbol, 0), int(plan["id"]))
+        await self._send_message(
+            chat_id,
+            "\n".join(
+                [
+                    "🧭 Planes por símbolo:",
+                    f"Planner: {'ON' if planner_enabled else 'OFF'}",
+                    f"Monitor: {'ON' if self._plan_monitor_enabled else 'OFF'}",
+                    "Último error planner: n/a",
+                    *[f"- {symbol}: último plan #{latest_by_symbol[symbol]}" for symbol in symbols[:10]],
+                ]
+            ),
+            reply_markup={"inline_keyboard": rows},
+        )
+
+    async def _send_plans_for_symbol(self, chat_id: str, symbol: str) -> None:
+        if self._storage is None:
+            await self._send_message(chat_id, "Storage no disponible.")
+            return
+        plans = [plan for plan in await self._storage.list_open_trade_plans() if str(plan["symbol"]) == symbol]
+        if not plans:
+            await self._send_message(chat_id, f"No hay planes abiertos para {symbol}.")
+            return
+        lines = [f"🧭 Planes {symbol}:"]
+        rows: list[list[dict[str, str]]] = []
+        for plan in plans[:10]:
+            lines.append(f"#{plan['id']} {plan['status']} [{float(plan['entry_low']):.4f}-{float(plan['entry_high']):.4f}]")
+            rows.append([{"text": f"Cancelar #{plan['id']}", "callback_data": f"cancelplan:{plan['id']}"}])
+        await self._send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": rows} if rows else None)
+
+    async def _monitor_panel_text(self) -> str:
+        if self._storage is None:
+            return "Storage no disponible."
+        plans = await self._storage.list_open_trade_plans()
+        lines = [
+            "🎯 TP/SL Monitor",
+            f"Planner: {'ON' if self._plan_builder is not None else 'OFF'}",
+            f"PlanMonitor: {'ON' if self._plan_monitor_enabled else 'OFF'}",
+            f"Próximo check aprox: {self._plan_monitor_interval_seconds}s",
+            f"Planes activos: {len(plans)}",
+            "Último error planner: n/a",
+        ]
+        for plan in plans[:10]:
+            lines.append(f"- #{plan['id']} {plan['symbol']} {plan['status']}")
+        return "\n".join(lines)
 
     async def _handle_addtrade(self, chat_id: str, _: str) -> None:
         self._sessions[chat_id] = ChatSession(mode="addtrade", step="symbol")
@@ -655,6 +927,7 @@ class TelegramCommandBot:
             macd = None
             sqz = None
             koncorde_line = ""
+            structure_by_tf: dict[str, dict[str, str | bool | float | None]] = {}
             for interval, label in (("15m", "M15"), ("5m", "M5 "), ("3m", "M3 "), ("1m", "M1 ")):
                 candles = await self._binance_client.get_klines(symbol, interval=interval, limit=210)
                 result = analyze_ema_signal(candles, fast_period=55, slow_period=200)
@@ -674,6 +947,25 @@ class TelegramCommandBot:
                         f"{koncorde['icon']} {koncorde['text']} | "
                         f"RSI {koncorde['rsi']:.1f} | Vol {koncorde['volume_ratio']:.2f}x"
                     )
+                if self._structure_enabled and interval in self._structure_timeframes:
+                    try:
+                        structure_by_tf[interval] = analyze_structure(
+                            candles,
+                            pivot_window=self._pivot_window,
+                            pullback_tolerance_mode=self._pullback_tolerance_mode,
+                            pullback_atr_mult=self._pullback_atr_mult,
+                            pullback_pct=self._pullback_pct,
+                            logger=self._logger,
+                        )
+                    except Exception as exc:
+                        self._logger.warning("Structure error /signal %s %s: %s", symbol, interval, exc)
+                        structure_by_tf[interval] = {
+                            "bias": "MIX",
+                            "bos": "NONE",
+                            "choch": "NONE",
+                            "pullback": "NONE",
+                            "summary": "error estructura",
+                        }
             assert m15_result is not None and koncorde is not None and adx is not None and macd is not None and sqz is not None
             quality = evaluate_signal_quality(
                 tf_directions=tf_directions,
@@ -682,6 +974,7 @@ class TelegramCommandBot:
                 adx_m15=adx,
                 macd_m15=macd,
                 sqzmom_m15=sqz,
+                structure_by_tf=structure_by_tf if self._structure_enabled else None,
             )
         except Exception as exc:
             self._logger.warning("No se pudo calcular /signal para %s: %s", symbol, exc)
@@ -702,6 +995,7 @@ class TelegramCommandBot:
         lines.extend(
             [
                 f"Resultado: {result_icon} {quality['result']}",
+                f"Tipo: {quality.get('signal_type', 'SIN_SEÑAL')}",
                 "",
                 "Sync:",
                 f"M15 {tf_icons[tf_directions['15m']]}",
@@ -715,11 +1009,320 @@ class TelegramCommandBot:
                 "Koncorde Lite:",
                 koncorde_line,
                 "",
+                "📐 ADX/DMI:",
+                str(quality.get("adx_human", {}).get("status", "🟡 Sin lectura ADX")),
+                f"Lectura: {quality.get('adx_human', {}).get('reading', 'Sin lectura')}",
+                f"Datos: {quality.get('adx_human', {}).get('data', '-')}",
+                f"Impacto: {quality.get('adx_human', {}).get('impact_score', 0)} score | filtro {quality.get('adx_human', {}).get('filtro', 'neutral')}",
+                "",
+                "🧬 Koncorde Lite M15:",
+                str(quality.get("koncorde_human", {}).get("status", "🟡 Flujo neutral")),
+                f"Lectura: {quality.get('koncorde_human', {}).get('reading', 'Sin lectura')}",
+                f"Datos: {quality.get('koncorde_human', {}).get('data', '-')}",
+                f"Impacto: {quality.get('koncorde_human', {}).get('impact_score', 0)} score | filtro {quality.get('koncorde_human', {}).get('filtro', 'neutral')}",
+                "",
+                "Estructura M15:",
+                (
+                    f"{'🟢' if structure_by_tf.get('15m', {}).get('bias') == 'BULL' else ('🔴' if structure_by_tf.get('15m', {}).get('bias') == 'BEAR' else '🟡')} "
+                    f"{structure_by_tf.get('15m', {}).get('bias', 'MIX')}"
+                ),
+                f"Último high > anterior {'✅' if bool(structure_by_tf.get('15m', {}).get('hh')) else '❌'}",
+                f"Último low > anterior {'✅' if bool(structure_by_tf.get('15m', {}).get('hl')) else '❌'}",
+                f"Último high < anterior {'✅' if bool(structure_by_tf.get('15m', {}).get('lh')) else '❌'}",
+                f"Último low < anterior {'✅' if bool(structure_by_tf.get('15m', {}).get('ll')) else '❌'}",
+                f"BOS: {structure_by_tf.get('15m', {}).get('bos', 'NONE')}",
+                f"CHoCH: {structure_by_tf.get('15m', {}).get('choch', 'NONE')}",
+                f"Pullback: {structure_by_tf.get('15m', {}).get('pullback', 'NONE')}",
+                f"Lectura: {structure_by_tf.get('15m', {}).get('summary', 'estructura mixta')}",
+                "",
                 "Calidad:",
                 f"🎯 {quality['quality']} | score {quality['score']}",
+                f"🧠 {quality.get('structure_notes', 'sin ajuste estructura')}",
+                f"⚠ Riesgo: {'momentum chase/riesgo alto' if quality.get('chase_risk') == 'high' else 'pullback/sync más limpio'}",
+                "Warnings:",
+                *(
+                    [f"- {item}" for item in quality.get("degraders", [])]
+                    if quality.get("degraders")
+                    else ["- ninguno"]
+                ),
+                *(
+                    [f"Reason: {quality.get('no_signal_reason')}"]
+                    if quality.get("no_signal_reason")
+                    else []
+                ),
+                "",
+                "🧠 Lectura humana:",
+                *[str(line) for line in quality.get("human_report", [])],
             ]
         )
         await self._send_message(chat_id, "\n".join(lines))
+
+    async def _handle_debug_signal(self, chat_id: str, args: str) -> None:
+        raw = args.strip()
+        if not raw:
+            raise ValueError("Uso:\n/debug_signal BTC\n/debug BTC")
+        if self._binance_client is None:
+            await self._send_message(chat_id, "No pude calcular /debug_signal. Cliente de Binance no disponible.")
+            return
+
+        symbol = self._normalize_futures_symbol(raw.split()[0])
+        try:
+            tf_icons = {"LONG": "🟢", "SHORT": "🔴", "NONE": "⚪"}
+            tf_directions: dict[str, str] = {}
+            m15_result = None
+            koncorde = None
+            adx = None
+            macd = None
+            sqz = None
+            structure_by_tf: dict[str, dict[str, str | bool | float | None]] = {}
+            for interval in ("15m", "5m", "3m", "1m"):
+                candles = await self._binance_client.get_klines(symbol, interval=interval, limit=210)
+                result = analyze_ema_signal(candles, fast_period=55, slow_period=200)
+                direction = "NONE"
+                if result["trend"] == "BULL":
+                    direction = "LONG"
+                elif result["trend"] == "BEAR":
+                    direction = "SHORT"
+                tf_directions[interval] = direction
+                if interval == "15m":
+                    m15_result = result
+                    koncorde = analyze_koncorde_lite(candles)
+                    adx = analyze_adx_dmi(candles)
+                    macd = analyze_macd([candle.close for candle in candles[:-1]])
+                    sqz = analyze_sqzmom(candles)
+                if self._structure_enabled and interval in self._structure_timeframes:
+                    structure_by_tf[interval] = analyze_structure(
+                        candles,
+                        pivot_window=self._pivot_window,
+                        pullback_tolerance_mode=self._pullback_tolerance_mode,
+                        pullback_atr_mult=self._pullback_atr_mult,
+                        pullback_pct=self._pullback_pct,
+                        logger=self._logger,
+                    )
+
+            assert m15_result is not None and koncorde is not None and adx is not None and macd is not None and sqz is not None
+            quality = evaluate_signal_quality(
+                tf_directions=tf_directions,
+                m15_ema=m15_result,
+                koncorde_m15=koncorde,
+                adx_m15=adx,
+                macd_m15=macd,
+                sqzmom_m15=sqz,
+                structure_by_tf=structure_by_tf if self._structure_enabled else None,
+            )
+            auto_alert_allowed, auto_alert_block_reason = evaluate_auto_alert_gate(
+                quality=quality,
+                structure_m15=structure_by_tf.get("15m", {}),
+                min_quality=self._scanner_min_quality,
+                allow_low_quality=self._scanner_alert_low_quality,
+                allow_momentum_chase=self._scanner_alert_momentum_chase,
+                require_adx_not_weak=self._scanner_require_adx_not_weak,
+                require_structure_confirmation=self._scanner_require_structure_confirmation,
+                block_dry_volume=self._scanner_block_dry_volume,
+            )
+            planner_enabled = self._plan_builder is not None
+            auto_plan_allowed, plan_block_reason = evaluate_plan_gate(
+                planner_enabled=planner_enabled,
+                quality_payload=quality,
+                structure_m15=structure_by_tf.get("15m", {}),
+            )
+            severity = "INFO"
+            quality_label = str(quality.get("quality", "BAJA"))
+            if quality_label == "MUY_ALTA":
+                severity = "CRITICAL"
+            elif quality_label == "ALTA":
+                severity = "WARNING"
+            elif quality_label == "MEDIA":
+                severity = "WARNING"
+            last_alert_state_exists = False
+            if self._storage is not None:
+                last_alert_state_exists = await self._storage.has_scanner_symbol_state(symbol)
+        except Exception as exc:
+            self._logger.warning("No se pudo calcular /debug_signal para %s: %s", symbol, exc)
+            await self._send_message(chat_id, f"No pude calcular /debug_signal para {symbol}. Motivo: {exc}")
+            return
+
+        lines = [
+            f"🧪 DEBUG {symbol}",
+            "",
+            "Resultado:",
+            f"type: {quality.get('signal_type', 'SIN_SEÑAL')}",
+            f"quality: {quality.get('quality', 'BAJA')}",
+            f"score: {quality.get('score_total', quality.get('score', 0))}",
+            f"alert_allowed: {str(bool(quality.get('alert_allowed', False))).lower()}",
+            f"scanner_auto_alert_allowed: {str(auto_alert_allowed).lower()}",
+            f"auto_alert_block_reason: {auto_alert_block_reason}",
+            f"planner_enabled: {str(planner_enabled).lower()}",
+            f"monitor_enabled: {str(self._plan_monitor_enabled).lower()}",
+            f"auto_plan_allowed: {str(auto_plan_allowed).lower()}",
+            "plan_created: false",
+            f"plan_block_reason: {plan_block_reason}",
+            f"severity: {severity}",
+            f"template_used: {'SIGNAL_WITH_PLAN' if auto_plan_allowed else 'SIGNAL_NO_PLAN'}",
+            "duplicate_key: n/a",
+            f"last_alert_state exists: {str(last_alert_state_exists).lower()}",
+            "",
+            "Sync:",
+            f"M15 {tf_icons[tf_directions['15m']]} | M5 {tf_icons[tf_directions['5m']]} | M3 {tf_icons[tf_directions['3m']]} | M1 {tf_icons[tf_directions['1m']]}",
+            "",
+            "Score +:",
+            *([str(item) for item in quality.get("score_items", [])] or ["none"]),
+            "",
+            "Penalties:",
+            *([str(item) for item in quality.get("penalties", [])] or ["none"]),
+            "",
+            "Blockers:",
+            *([str(item) for item in quality.get("blockers", [])] or ["none"]),
+            "",
+            "Degraders:",
+            *([str(item) for item in quality.get("degraders", [])] or ["none"]),
+            "",
+            f"Reason: {quality.get('no_signal_reason', '') or 'n/a'}",
+        ]
+        await self._send_message(chat_id, "\n".join(lines))
+
+    async def _compute_signal_quality(self, symbol: str) -> tuple[dict[str, str], dict, dict]:
+        tf_directions: dict[str, str] = {}
+        m15_result = None
+        koncorde = None
+        adx = None
+        macd = None
+        sqz = None
+        structure_by_tf: dict[str, dict[str, str | bool | float | None]] = {}
+        assert self._binance_client is not None
+        for interval in ("15m", "5m", "3m", "1m"):
+            candles = await self._binance_client.get_klines(symbol, interval=interval, limit=210)
+            result = analyze_ema_signal(candles, fast_period=55, slow_period=200)
+            direction = "NONE"
+            if result["trend"] == "BULL":
+                direction = "LONG"
+            elif result["trend"] == "BEAR":
+                direction = "SHORT"
+            tf_directions[interval] = direction
+            if interval == "15m":
+                m15_result = result
+                koncorde = analyze_koncorde_lite(candles)
+                adx = analyze_adx_dmi(candles)
+                macd = analyze_macd([candle.close for candle in candles[:-1]])
+                sqz = analyze_sqzmom(candles)
+            if self._structure_enabled and interval in self._structure_timeframes:
+                structure_by_tf[interval] = analyze_structure(
+                    candles,
+                    pivot_window=self._pivot_window,
+                    pullback_tolerance_mode=self._pullback_tolerance_mode,
+                    pullback_atr_mult=self._pullback_atr_mult,
+                    pullback_pct=self._pullback_pct,
+                    logger=self._logger,
+                )
+        assert m15_result is not None and koncorde is not None and adx is not None and macd is not None and sqz is not None
+        quality = evaluate_signal_quality(
+            tf_directions=tf_directions,
+            m15_ema=m15_result,
+            koncorde_m15=koncorde,
+            adx_m15=adx,
+            macd_m15=macd,
+            sqzmom_m15=sqz,
+            structure_by_tf=structure_by_tf if self._structure_enabled else None,
+        )
+        return tf_directions, quality, structure_by_tf
+
+    async def _handle_plan(self, chat_id: str, args: str) -> None:
+        raw = args.strip()
+        if not raw:
+            raise ValueError("Uso:\n/plan BTC")
+        if self._binance_client is None or self._plan_builder is None:
+            await self._send_message(chat_id, "Planner no disponible en este runtime.")
+            return
+        symbol = self._normalize_futures_symbol(raw.split()[0])
+        try:
+            _, quality, structure_by_tf = await self._compute_signal_quality(symbol)
+            current_price, _, _ = await self._get_price_snapshot(symbol)
+            plan_id = await self._plan_builder(
+                symbol=symbol,
+                quality_payload=quality,
+                current_price=current_price,
+                structure_m15=structure_by_tf.get("15m", {}),
+                study_mode=False,
+            )
+        except Exception as exc:
+            await self._send_message(chat_id, f"No pude crear plan para {symbol}. Motivo: {exc}")
+            return
+        if plan_id is None:
+            await self._send_message(
+                chat_id,
+                f"Plan omitido para {symbol}. Tipo={quality.get('signal_type','SIN_SEÑAL')} | reason={quality.get('no_signal_reason','n/a')}",
+            )
+            return
+        assert self._storage is not None
+        plan = await self._storage.get_trade_plan(plan_id)
+        assert plan is not None
+        await self._send_message(
+            chat_id,
+            "\n".join(
+                [
+                    f"🧭 {symbol} — Plan {plan['direction']} sugerido",
+                    "",
+                    f"Plan: #{plan_id} | Tipo: {plan['signal_type']} | Calidad: {plan['quality']}",
+                    f"Entrada ideal: {float(plan['entry_low']):.6f} - {float(plan['entry_high']):.6f}",
+                    f"SL: {float(plan['stop_loss']):.6f}",
+                    f"TP1: {float(plan['tp1']):.6f} | {float(plan['rr_tp1']):.2f}R",
+                    f"TP2: {float(plan['tp2']):.6f} | {float(plan['rr_tp2']):.2f}R",
+                    f"TP3: {float(plan['tp3']):.6f} | {float(plan['rr_tp3']):.2f}R",
+                    "⚠ Solo plan. No orden.",
+                ]
+            ),
+        )
+
+    async def _handle_plans(self, chat_id: str, _: str) -> None:
+        if self._storage is None:
+            await self._send_message(chat_id, "Storage no disponible.")
+            return
+        plans = await self._storage.list_open_trade_plans()
+        if not plans:
+            await self._send_message(chat_id, "No hay planes abiertos.")
+            return
+        lines = ["🧭 Planes abiertos:"]
+        for plan in plans[:20]:
+            lines.append(
+                f"#{plan['id']} {plan['symbol']} {plan['direction']} {plan['signal_type']} {plan['status']} [{float(plan['entry_low']):.4f}-{float(plan['entry_high']):.4f}]"
+            )
+        await self._send_message(chat_id, "\n".join(lines))
+
+    async def _handle_plan_status(self, chat_id: str, args: str) -> None:
+        if self._storage is None:
+            await self._send_message(chat_id, "Storage no disponible.")
+            return
+        raw = args.strip()
+        if not raw.isdigit():
+            raise ValueError("Uso:\n/plan_status <id>")
+        plan = await self._storage.get_trade_plan(int(raw))
+        if plan is None:
+            await self._send_message(chat_id, f"Plan #{raw} no encontrado.")
+            return
+        await self._send_message(
+            chat_id,
+            "\n".join(
+                [
+                    f"Plan #{plan['id']} | {plan['symbol']} {plan['direction']}",
+                    f"Tipo: {plan['signal_type']} | Calidad: {plan['quality']} | Estado: {plan['status']}",
+                    f"Entrada: {float(plan['entry_low']):.6f}-{float(plan['entry_high']):.6f}",
+                    f"SL: {float(plan['stop_loss']):.6f}",
+                    f"TP1/TP2/TP3: {float(plan['tp1']):.6f} / {float(plan['tp2']):.6f} / {float(plan['tp3']):.6f}",
+                    f"Expira: {plan['expires_at']}",
+                ]
+            ),
+        )
+
+    async def _handle_cancel_plan(self, chat_id: str, args: str) -> None:
+        if self._storage is None:
+            await self._send_message(chat_id, "Storage no disponible.")
+            return
+        raw = args.strip()
+        if not raw.isdigit():
+            raise ValueError("Uso:\n/cancel_plan <id>")
+        plan_id = int(raw)
+        await self._storage.update_trade_plan_status(plan_id, "CANCELLED")
+        await self._send_message(chat_id, f"Plan #{plan_id} cancelado. No se tocó Binance.")
 
     async def _handle_close(self, chat_id: str, args: str) -> None:
         symbol = self._parse_symbol_argument(args)

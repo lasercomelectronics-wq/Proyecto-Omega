@@ -44,6 +44,9 @@ class TelegramNotifier:
         return f"{value:.{digits}f}"
 
     def _build_message(self, event: AlertEvent) -> str:
+        if bool((event.metadata or {}).get("scanner", False)) and event.note:
+            return event.note
+
         lines = [f"<b>{html.escape(event.priority.value)} | Trading Alert</b>"]
 
         if event.symbol != "SYSTEM":

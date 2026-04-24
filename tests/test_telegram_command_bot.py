@@ -35,6 +35,18 @@ def make_update(chat_id: str, text: str, update_id: int = 1) -> dict:
     }
 
 
+def make_callback_update(chat_id: str, data: str, update_id: int = 100) -> dict:
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": f"cb-{update_id}",
+            "from": {"id": int(chat_id)},
+            "data": data,
+            "message": {"message_id": update_id, "chat": {"id": chat_id, "type": "private"}},
+        },
+    }
+
+
 class FakeBinanceClient:
     def __init__(
         self,
@@ -276,6 +288,33 @@ def test_watchlist_empty_and_add_remove_flow(tmp_path: Path) -> None:
 
             await bot.handle_update(make_update("123", "/remove watchlist BTC", 4))
             assert trade_manager.get_watchlist_symbols() == []
+        finally:
+            await bot.close()
+            await storage.close()
+
+    run(scenario())
+
+
+def test_menu_command_sends_panel(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        bot, _, storage, sent = await build_bot(tmp_path)
+        try:
+            await bot.handle_update(make_update("123", "/menu", 1))
+            assert sent
+            assert sent[-1][1] == "🤖 Trading Bot Panel"
+        finally:
+            await bot.close()
+            await storage.close()
+
+    run(scenario())
+
+
+def test_callback_unauthorized_is_ignored(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        bot, _, storage, sent = await build_bot(tmp_path)
+        try:
+            await bot.handle_update(make_callback_update("999", "menu:watchlist", 1))
+            assert sent == []
         finally:
             await bot.close()
             await storage.close()
