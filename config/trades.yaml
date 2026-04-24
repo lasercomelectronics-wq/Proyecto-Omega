@@ -1,0 +1,30 @@
+trades:
+  - symbol: WLDUSDT
+    side: SHORT
+    entry: 0.8912
+    leverage: 20
+    stop_loss: 0.9050
+    take_profits:
+      - 0.8820
+      - 0.8740
+      - 0.8600
+    invalidation_zone:
+      min: 0.9020
+      max: 0.9060
+    add_zones:
+      - price: 0.8980
+        size_usdt: 1
+        note: "Micro add solo si hay rechazo y bajo volumen comprador"
+    alerts:
+      cooldown_seconds: 300
+      notify_on_tp: true
+      notify_on_sl_distance: true
+      notify_on_invalidation_zone: true
+      notify_on_break_even: true
+    strategy:
+      ema_fast: 55
+      ema_slow: 200
+      use_structure: true
+      pivot_length: 5
+      use_squeeze_momentum_placeholder: true
+    note: "Setup de ejemplo. El bot no ejecuta órdenes; solo monitorea y alerta."

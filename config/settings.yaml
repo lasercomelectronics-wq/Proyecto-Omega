@@ -1,0 +1,20 @@
+app:
+  log_level: INFO
+  context_refresh_seconds: 300
+
+binance:
+  recv_window: 5000
+  rest_timeout_seconds: 15
+  kline_interval: 1m
+  kline_limit: 250
+  market_stream_suffix: "@markPrice@1s"
+  user_stream_keepalive_minutes: 45
+  reconnect_backoff_seconds: [1, 3, 5, 10, 20]
+
+alerts:
+  stop_loss_warning_pct: 0.35
+  break_even_trigger_rr: 0.5
+  entry_revisit_tolerance_pct: 0.05
+  add_zone_tolerance_pct: 0.05
+  system_cooldown_seconds: 120
+  telegram_parse_mode: HTML
