@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
+import logging
 import time
 from typing import Any
 from urllib.parse import urlencode
 
 import httpx
 
+from app.binance_guard import BinanceRateLimitGuard, TTLCache
 from app.models import Candle, PositionSnapshot, TradeSide
 
 
@@ -37,7 +40,19 @@ class BinanceFuturesClient:
         testnet: bool = False,
         recv_window: int = 5000,
         timeout_seconds: float = 15.0,
+        guard_enabled: bool = True,
+        cache_enabled: bool = True,
+        backoff_enabled: bool = True,
+        rate_limit_pause_seconds: int = 60,
+        mark_price_cache_ttl: int = 2,
+        klines_1m_cache_ttl: int = 15,
+        klines_3m_cache_ttl: int = 30,
+        klines_5m_cache_ttl: int = 45,
+        klines_15m_cache_ttl: int = 90,
+        position_cache_ttl: int = 10,
+        exchange_info_cache_ttl: int = 3600,
     ) -> None:
+        self._logger = logging.getLogger("app.binance_client")
         self._api_key = api_key
         self._api_secret = api_secret
         self._recv_window = recv_window
@@ -47,6 +62,15 @@ class BinanceFuturesClient:
             base_url=self._base_url,
             timeout=httpx.Timeout(timeout_seconds),
         )
+        self._guard_enabled = guard_enabled
+        self._cache_enabled = cache_enabled
+        self._backoff_enabled = backoff_enabled
+        self._guard = BinanceRateLimitGuard(pause_seconds=rate_limit_pause_seconds)
+        self._cache = TTLCache()
+        self._mark_price_cache_ttl = mark_price_cache_ttl
+        self._klines_ttls = {"1m": klines_1m_cache_ttl, "3m": klines_3m_cache_ttl, "5m": klines_5m_cache_ttl, "15m": klines_15m_cache_ttl}
+        self._position_cache_ttl = position_cache_ttl
+        self._exchange_info_cache_ttl = exchange_info_cache_ttl
 
     @property
     def market_ws_base_url(self) -> str:
@@ -86,6 +110,10 @@ class BinanceFuturesClient:
         signed: bool = False,
         api_key_only: bool = False,
     ) -> Any:
+        if self._guard_enabled and self._backoff_enabled:
+            allowed, reason = self._guard.can_request()
+            if not allowed:
+                raise BinanceAPIError(f"Binance guard activo: {reason}", status_code=429)
         payload = dict(params or {})
         headers: dict[str, str] = {}
 
@@ -106,8 +134,12 @@ class BinanceFuturesClient:
             request_kwargs["data"] = payload
 
         try:
+            if self._guard_enabled:
+                self._guard.register_request(path)
             response = await self._client.request(method=method, url=path, **request_kwargs)
+            self._logger.debug("Binance request registered: %s %s -> %s", method.upper(), path, response.status_code)
         except httpx.HTTPError as exc:
+            self._logger.warning("Binance HTTP error on %s %s: %s", method.upper(), path, exc)
             raise BinanceAPIError(f"Fallo HTTP contra Binance: {exc}") from exc
 
         data: Any
@@ -117,6 +149,15 @@ class BinanceFuturesClient:
             data = response.text
 
         if response.status_code >= 400:
+            if self._guard_enabled:
+                self._guard.register_http_error(response.status_code, dict(response.headers), str(data))
+            if response.status_code in {429, 418}:
+                self._logger.warning(
+                    "Binance throttling/ban status=%s retry-after=%s endpoint=%s",
+                    response.status_code,
+                    dict(response.headers).get("retry-after"),
+                    path,
+                )
             if isinstance(data, dict):
                 raise BinanceAPIError(
                     data.get("msg", f"HTTP {response.status_code}"),
@@ -132,7 +173,25 @@ class BinanceFuturesClient:
                 status_code=response.status_code,
             )
 
+        if self._guard_enabled:
+            self._guard.register_success(response.status_code, dict(response.headers))
         return data
+
+    @staticmethod
+    def _cache_key(path: str, params: dict[str, Any] | None = None) -> str:
+        return json.dumps({"path": path, "params": params or {}}, sort_keys=True, default=str)
+
+    def _cache_get(self, key: str) -> Any | None:
+        if not self._cache_enabled:
+            return None
+        value = self._cache.get(key)
+        self._logger.debug("Binance cache %s key=%s", "hit" if value is not None else "miss", key)
+        return value
+
+    def _cache_set(self, key: str, value: Any, ttl: int) -> None:
+        if not self._cache_enabled:
+            return
+        self._cache.set(key, value, ttl)
 
     @staticmethod
     def _derive_trade_side(position_side: str | None, position_amount: float) -> TradeSide:
@@ -150,12 +209,18 @@ class BinanceFuturesClient:
 
     async def get_positions(self, symbol: str | None = None) -> list[PositionSnapshot]:
         params = {"symbol": symbol} if symbol else None
-        response = await self._request(
-            "GET",
-            "/fapi/v3/positionRisk",
-            params=params,
-            signed=True,
-        )
+        cache_key = self._cache_key("/fapi/v3/positionRisk", params)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            response = cached
+        else:
+            response = await self._request(
+                "GET",
+                "/fapi/v3/positionRisk",
+                params=params,
+                signed=True,
+            )
+            self._cache_set(cache_key, response, self._position_cache_ttl)
 
         positions: list[PositionSnapshot] = []
         for item in response:
@@ -181,11 +246,14 @@ class BinanceFuturesClient:
         return positions
 
     async def get_klines(self, symbol: str, interval: str, limit: int) -> list[Candle]:
-        response = await self._request(
-            "GET",
-            "/fapi/v1/klines",
-            params={"symbol": symbol.upper(), "interval": interval, "limit": limit},
-        )
+        params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
+        cache_key = self._cache_key("/fapi/v1/klines", params)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            response = cached
+        else:
+            response = await self._request("GET", "/fapi/v1/klines", params=params)
+            self._cache_set(cache_key, response, self._klines_ttls.get(interval, 15))
         return [
             Candle(
                 open_time=int(row[0]),
@@ -200,11 +268,14 @@ class BinanceFuturesClient:
         ]
 
     async def get_mark_price(self, symbol: str) -> tuple[float, int | None]:
-        response = await self._request(
-            "GET",
-            "/fapi/v1/premiumIndex",
-            params={"symbol": symbol.upper()},
-        )
+        params = {"symbol": symbol.upper()}
+        cache_key = self._cache_key("/fapi/v1/premiumIndex", params)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            response = cached
+        else:
+            response = await self._request("GET", "/fapi/v1/premiumIndex", params=params)
+            self._cache_set(cache_key, response, self._mark_price_cache_ttl)
         if not isinstance(response, dict) or "markPrice" not in response:
             raise BinanceAPIError(f"Respuesta inesperada al consultar mark price para {symbol.upper()}.")
         event_time = response.get("time")
@@ -220,3 +291,31 @@ class BinanceFuturesClient:
 
     async def close_user_data_stream(self) -> None:
         await self._request("DELETE", "/fapi/v1/listenKey", api_key_only=True)
+
+    def get_api_status(self) -> dict[str, Any]:
+        self._guard.set_cache_stats(
+            enabled=self._cache_enabled,
+            hits=self._cache.hits,
+            misses=self._cache.misses,
+            size=self._cache.size,
+        )
+        snapshot = self._guard.snapshot()
+        cache_total = self._cache.hits + self._cache.misses
+        hit_rate = (self._cache.hits / cache_total * 100.0) if cache_total > 0 else 0.0
+        snapshot.update(
+            {
+                "guard_enabled": self._guard_enabled,
+                "cache_enabled": self._cache_enabled,
+                "cache_hits": self._cache.hits,
+                "cache_misses": self._cache.misses,
+                "cache_size": self._cache.size,
+                "cache_hit_rate": round(hit_rate, 2),
+                "scanner_paused": bool(snapshot.get("scanner_paused", False))
+                or snapshot["status"] in {"RATE_LIMITED", "IP_BANNED", "WAF_OR_FORBIDDEN"},
+            }
+        )
+        return snapshot
+
+    def is_rest_paused(self) -> bool:
+        status = self.get_api_status().get("status")
+        return status in {"RATE_LIMITED", "IP_BANNED", "WAF_OR_FORBIDDEN"}

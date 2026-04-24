@@ -35,6 +35,18 @@ def make_update(chat_id: str, text: str, update_id: int = 1) -> dict:
     }
 
 
+def make_callback_update(chat_id: str, data: str, update_id: int = 100) -> dict:
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": f"cb-{update_id}",
+            "from": {"id": int(chat_id)},
+            "data": data,
+            "message": {"message_id": update_id, "chat": {"id": chat_id, "type": "private"}},
+        },
+    }
+
+
 class FakeBinanceClient:
     def __init__(
         self,
@@ -65,6 +77,7 @@ async def build_bot(
     *,
     fake_client: FakeBinanceClient | None = None,
     cached_prices: dict[str, tuple[float, str, int | None]] | None = None,
+    binance_status_provider=None,
 ):
     sent_messages: list[tuple[str, str]] = []
     storage = Storage(tmp_path / "bot.sqlite")
@@ -102,6 +115,7 @@ async def build_bot(
         binance_client=fake_client,
         current_price_provider=current_price_provider,
         sender=sender,
+        binance_status_provider=binance_status_provider,
     )
     return bot, trade_manager, storage, sent_messages
 
@@ -276,6 +290,179 @@ def test_watchlist_empty_and_add_remove_flow(tmp_path: Path) -> None:
 
             await bot.handle_update(make_update("123", "/remove watchlist BTC", 4))
             assert trade_manager.get_watchlist_symbols() == []
+        finally:
+            await bot.close()
+            await storage.close()
+
+    run(scenario())
+
+
+def test_menu_command_sends_panel(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        bot, _, storage, sent = await build_bot(tmp_path)
+        try:
+            await bot.handle_update(make_update("123", "/menu", 1))
+            assert sent
+            assert sent[-1][1] == "🤖 Trading Bot Panel"
+        finally:
+            await bot.close()
+            await storage.close()
+
+    run(scenario())
+
+
+def test_callback_unauthorized_is_ignored(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        bot, _, storage, sent = await build_bot(tmp_path)
+        try:
+            await bot.handle_update(make_callback_update("999", "menu:watchlist", 1))
+            assert sent == []
+        finally:
+            await bot.close()
+            await storage.close()
+
+    run(scenario())
+
+
+def test_plan_without_args_shows_watchlist_selector(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        bot, trade_manager, storage, sent = await build_bot(tmp_path)
+        try:
+            await trade_manager.add_watchlist_symbol("BTCUSDT")
+            await trade_manager.add_watchlist_symbol("ETHUSDT")
+            await bot.handle_update(make_update("123", "/plan", 1))
+            assert "🧭 Crear plan técnico" in sent[-1][1]
+            assert "Elegí un par de la watchlist" in sent[-1][1]
+        finally:
+            await bot.close()
+            await storage.close()
+
+    run(scenario())
+
+
+def test_plan_without_args_watchlist_empty(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        bot, _, storage, sent = await build_bot(tmp_path)
+        try:
+            await bot.handle_update(make_update("123", "/plan", 1))
+            assert "📡 Watchlist vacía" in sent[-1][1]
+        finally:
+            await bot.close()
+            await storage.close()
+
+    run(scenario())
+
+
+def test_plan_direct_legacy_kept(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        bot, _, storage, sent = await build_bot(tmp_path)
+        try:
+            await bot.handle_update(make_update("123", "/plan BTC", 1))
+            assert "Planner no disponible en este runtime." in sent[-1][1]
+        finally:
+            await bot.close()
+            await storage.close()
+
+    run(scenario())
+
+
+def test_monitor_status_command(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        bot, _, storage, sent = await build_bot(tmp_path)
+        try:
+            await bot.handle_update(make_update("123", "/monitor_status", 1))
+            assert "📡 Monitor TP/SL" in sent[-1][1]
+            assert "Estado:" in sent[-1][1]
+        finally:
+            await bot.close()
+            await storage.close()
+
+    run(scenario())
+
+
+def test_binance_status_command(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        bot, _, storage, sent = await build_bot(tmp_path)
+        try:
+            await bot.handle_update(make_update("123", "/binance_status", 1))
+            assert "🛰 Binance API Monitor" in sent[-1][1]
+            assert "Estado:" in sent[-1][1]
+        finally:
+            await bot.close()
+            await storage.close()
+
+    run(scenario())
+
+
+def test_binance_alias_command_renders_metrics(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        def provider() -> dict[str, object]:
+            return {
+                "status": "RATE_LIMITED",
+                "is_banned": False,
+                "degraded_mode": True,
+                "requests_last_60s": 7,
+                "requests_last_5m": 15,
+                "total_requests_session": 80,
+                "used_weight_1m": "240",
+                "used_weight_raw_headers": "{'x-mbx-used-weight-1m': '240'}",
+                "count_429": 2,
+                "count_418": 0,
+                "count_403": 1,
+                "cache_enabled": True,
+                "cache_hits": 10,
+                "cache_misses": 5,
+                "cache_size": 3,
+                "cache_hit_rate": 66.67,
+                "scanner_paused": True,
+                "last_success_at": 1710000000.0,
+                "last_error": "Too many requests",
+            }
+
+        bot, _, storage, sent = await build_bot(tmp_path, binance_status_provider=provider)
+        try:
+            await bot.handle_update(make_update("123", "/binance", 1))
+            message = sent[-1][1]
+            assert "🛰 Binance API Monitor" in message
+            assert "Último minuto: 7" in message
+            assert "429: 2" in message
+            assert "Hit-rate: 66.67%" in message
+            assert "Scanner: PAUSED" in message
+        finally:
+            await bot.close()
+            await storage.close()
+
+    run(scenario())
+
+
+def test_plans_show_monitor_fields(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        bot, _, storage, sent = await build_bot(tmp_path)
+        try:
+            await storage.create_trade_plan(
+                {
+                    "symbol": "BTCUSDT",
+                    "direction": "LONG",
+                    "signal_type": "LONG_PULLBACK",
+                    "quality": "ALTA",
+                    "entry_zone_low": 100.0,
+                    "entry_zone_high": 101.0,
+                    "stop_loss": 99.0,
+                    "tp1": 102.0,
+                    "tp2": 103.0,
+                    "tp3": 104.0,
+                    "rr_tp1": 1.0,
+                    "rr_tp2": 2.0,
+                    "rr_tp3": 3.0,
+                    "status": "CREATED",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "expires_at": "2026-01-01T02:00:00+00:00",
+                }
+            )
+            await bot.handle_update(make_update("123", "/plans", 1))
+            assert "Monitor:" in sent[-1][1]
+            assert "TP1" in sent[-1][1]
+            assert "Expira:" in sent[-1][1]
         finally:
             await bot.close()
             await storage.close()

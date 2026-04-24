@@ -18,6 +18,9 @@ from app.storage import Storage
 from app.strategy_engine import build_market_context
 from app.telegram_command_bot import TelegramCommandBot, TelegramCommandBotError
 from app.telegram_notifier import TelegramNotificationError, TelegramNotifier
+from app.plan_monitor import PlanMonitor
+from app.single_instance import SingleInstanceError, SingleInstanceLock
+from app.trade_planner import build_trade_plan, evaluate_plan_gate, trade_plan_to_dict
 from app.trade_manager import TradeManager
 
 
@@ -34,6 +37,16 @@ def _env_int(name: str, default: int) -> int:
         return default
     try:
         return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw.strip())
     except ValueError:
         return default
 
@@ -60,7 +73,33 @@ class TradingAlertBot:
         self.scanner_enabled = True
         self.scanner_alerts_enabled = True
         self.scanner_interval_seconds = 60
+        self.structure_enabled = True
+        self.structure_timeframes = ("15m", "5m", "3m")
+        self.pivot_window = 3
+        self.pullback_tolerance_mode = "atr"
+        self.pullback_atr_mult = 0.25
+        self.pullback_pct = 0.15
+        self.scanner_alert_low_quality = False
+        self.scanner_alert_momentum_chase = False
+        self.scanner_min_quality = "MEDIA"
+        self.scanner_require_adx_not_weak = True
+        self.scanner_require_structure_confirmation = False
+        self.scanner_block_dry_volume = True
         self.latest_prices: dict[str, PriceUpdate] = {}
+        self.trade_planner_enabled = True
+        self.plan_monitor_enabled = True
+        self.plan_monitor_interval_seconds = 15
+        self.plan_expire_minutes = 120
+        self.plan_use_volume_profile = False
+        self.plan_use_order_blocks = True
+        self.plan_use_fib = True
+        self.plan_min_rr_tp1 = 1.0
+        self.plan_atr_buffer_mult = 0.25
+        self.plan_monitor: PlanMonitor | None = None
+        self.binance_guard_enabled = True
+        self.binance_cache_enabled = True
+        self.binance_backoff_enabled = True
+        self.binance_rate_limit_pause_seconds = 60
 
     def _runtime_status(self) -> dict[str, str | int]:
         assert self.trade_manager is not None
@@ -74,6 +113,32 @@ class TradingAlertBot:
             "SCANNER_ALERTS_ENABLED": str(self.scanner_alerts_enabled).lower(),
             "SCANNER_INTERVAL_SECONDS": self.scanner_interval_seconds,
         }
+
+    def _scanner_state(self) -> dict[str, dict[str, object]]:
+        if self.scanner is None:
+            return {}
+        return self.scanner.get_last_scan_state()
+
+    def _monitor_status(self) -> dict[str, object]:
+        if self.plan_monitor is None:
+            return {
+                "enabled": False,
+                "interval_seconds": self.plan_monitor_interval_seconds,
+                "open_plans_count": 0,
+                "events_sent": 0,
+                "last_cycle_at": None,
+                "price_source": "mark_price",
+                "alerts_enabled": True,
+                "last_error": "PLAN_MONITOR_ENABLED=false o no iniciado en main",
+            }
+        payload = self.plan_monitor.get_status()
+        payload["enabled"] = bool(self.plan_monitor_enabled)
+        return payload
+
+    def _binance_status(self) -> dict[str, object]:
+        if self.binance_client is None:
+            return {"status": "DEGRADED", "last_error": "Binance client no disponible"}
+        return self.binance_client.get_api_status()
 
     async def initialize(self) -> None:
         load_dotenv(self.root_dir / ".env")
@@ -105,6 +170,35 @@ class TradingAlertBot:
         self.scanner_enabled = _env_flag("SCANNER_ENABLED", True)
         self.scanner_alerts_enabled = _env_flag("SCANNER_ALERTS_ENABLED", True)
         self.scanner_interval_seconds = _env_int("SCANNER_INTERVAL_SECONDS", 60)
+        self.structure_enabled = _env_flag("STRUCTURE_ENABLED", True)
+        self.structure_timeframes = tuple(
+            item.strip().lower()
+            for item in os.getenv("STRUCTURE_TIMEFRAMES", "15m,5m,3m").split(",")
+            if item.strip()
+        )
+        self.pivot_window = _env_int("PIVOT_WINDOW", 3)
+        self.pullback_tolerance_mode = os.getenv("PULLBACK_TOLERANCE_MODE", "atr").strip().lower() or "atr"
+        self.pullback_atr_mult = _env_float("PULLBACK_ATR_MULT", 0.25)
+        self.pullback_pct = _env_float("PULLBACK_PCT", 0.15)
+        self.scanner_alert_low_quality = _env_flag("SCANNER_ALERT_LOW_QUALITY", False)
+        self.scanner_alert_momentum_chase = _env_flag("SCANNER_ALERT_MOMENTUM_CHASE", False)
+        self.scanner_min_quality = (os.getenv("SCANNER_MIN_QUALITY", "MEDIA").strip().upper() or "MEDIA")
+        self.scanner_require_adx_not_weak = _env_flag("SCANNER_REQUIRE_ADX_NOT_WEAK", True)
+        self.scanner_require_structure_confirmation = _env_flag("SCANNER_REQUIRE_STRUCTURE_CONFIRMATION", False)
+        self.scanner_block_dry_volume = _env_flag("SCANNER_BLOCK_DRY_VOLUME", True)
+        self.trade_planner_enabled = _env_flag("TRADE_PLANNER_ENABLED", True)
+        self.plan_monitor_enabled = _env_flag("PLAN_MONITOR_ENABLED", True)
+        self.plan_monitor_interval_seconds = _env_int("PLAN_MONITOR_INTERVAL_SECONDS", 15)
+        self.plan_expire_minutes = _env_int("PLAN_EXPIRE_MINUTES", 120)
+        self.plan_use_volume_profile = _env_flag("PLAN_USE_VOLUME_PROFILE", False)
+        self.plan_use_order_blocks = _env_flag("PLAN_USE_ORDER_BLOCKS", True)
+        self.plan_use_fib = _env_flag("PLAN_USE_FIB", True)
+        self.plan_min_rr_tp1 = _env_float("PLAN_MIN_RR_TP1", 1.0)
+        self.plan_atr_buffer_mult = _env_float("PLAN_ATR_BUFFER_MULT", 0.25)
+        self.binance_guard_enabled = _env_flag("BINANCE_GUARD_ENABLED", True)
+        self.binance_cache_enabled = _env_flag("BINANCE_CACHE_ENABLED", True)
+        self.binance_backoff_enabled = _env_flag("BINANCE_BACKOFF_ENABLED", True)
+        self.binance_rate_limit_pause_seconds = _env_int("BINANCE_RATE_LIMIT_PAUSE_SECONDS", 60)
 
         self.binance_client = BinanceFuturesClient(
             api_key=os.getenv("BINANCE_API_KEY", ""),
@@ -112,6 +206,17 @@ class TradingAlertBot:
             testnet=self.binance_testnet,
             recv_window=self.settings.binance.recv_window,
             timeout_seconds=self.settings.binance.rest_timeout_seconds,
+            guard_enabled=self.binance_guard_enabled,
+            cache_enabled=self.binance_cache_enabled,
+            backoff_enabled=self.binance_backoff_enabled,
+            rate_limit_pause_seconds=self.binance_rate_limit_pause_seconds,
+            mark_price_cache_ttl=_env_int("MARK_PRICE_CACHE_TTL", 2),
+            klines_1m_cache_ttl=_env_int("KLINES_1M_CACHE_TTL", 15),
+            klines_3m_cache_ttl=_env_int("KLINES_3M_CACHE_TTL", 30),
+            klines_5m_cache_ttl=_env_int("KLINES_5M_CACHE_TTL", 45),
+            klines_15m_cache_ttl=_env_int("KLINES_15M_CACHE_TTL", 90),
+            position_cache_ttl=_env_int("POSITION_CACHE_TTL", 10),
+            exchange_info_cache_ttl=_env_int("EXCHANGE_INFO_CACHE_TTL", 3600),
         )
         self.telegram = TelegramNotifier(
             bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
@@ -128,6 +233,30 @@ class TradingAlertBot:
             binance_client=self.binance_client,
             current_price_provider=self.get_cached_price,
             on_trade_changed=self.handle_tradebook_changed,
+            storage=self.storage,
+            plan_builder=self.build_plan_for_signal,
+            plan_expire_minutes=self.plan_expire_minutes,
+            plan_use_fib=self.plan_use_fib,
+            plan_use_order_blocks=self.plan_use_order_blocks,
+            plan_min_rr_tp1=self.plan_min_rr_tp1,
+            plan_atr_buffer_mult=self.plan_atr_buffer_mult,
+            structure_enabled=self.structure_enabled,
+            structure_timeframes=self.structure_timeframes,
+            pivot_window=self.pivot_window,
+            pullback_tolerance_mode=self.pullback_tolerance_mode,
+            pullback_atr_mult=self.pullback_atr_mult,
+            pullback_pct=self.pullback_pct,
+            scanner_alert_low_quality=self.scanner_alert_low_quality,
+            scanner_alert_momentum_chase=self.scanner_alert_momentum_chase,
+            scanner_min_quality=self.scanner_min_quality,
+            scanner_require_adx_not_weak=self.scanner_require_adx_not_weak,
+            scanner_require_structure_confirmation=self.scanner_require_structure_confirmation,
+            scanner_block_dry_volume=self.scanner_block_dry_volume,
+            scanner_state_provider=self._scanner_state,
+            monitor_status_provider=self._monitor_status,
+            binance_status_provider=self._binance_status,
+            plan_monitor_enabled=self.plan_monitor_enabled,
+            plan_monitor_interval_seconds=self.plan_monitor_interval_seconds,
         )
         if self.scanner_enabled:
             self.scanner = SignalScanner(
@@ -138,6 +267,27 @@ class TradingAlertBot:
                 logger=self.logger,
                 interval_seconds=self.scanner_interval_seconds,
                 alerts_enabled=self.scanner_alerts_enabled,
+                structure_enabled=self.structure_enabled,
+                structure_timeframes=self.structure_timeframes,
+                pivot_window=self.pivot_window,
+                pullback_tolerance_mode=self.pullback_tolerance_mode,
+                pullback_atr_mult=self.pullback_atr_mult,
+                pullback_pct=self.pullback_pct,
+                alert_low_quality=self.scanner_alert_low_quality,
+                alert_momentum_chase=self.scanner_alert_momentum_chase,
+                min_quality=self.scanner_min_quality,
+                require_adx_not_weak=self.scanner_require_adx_not_weak,
+                require_structure_confirmation=self.scanner_require_structure_confirmation,
+                block_dry_volume=self.scanner_block_dry_volume,
+                on_signal_sent=self.handle_scanner_signal_sent,
+            )
+        if self.plan_monitor_enabled:
+            self.plan_monitor = PlanMonitor(
+                storage=self.storage,
+                binance_client=self.binance_client,
+                dispatch_alerts=self._dispatch_alerts,
+                logger=self.logger,
+                interval_seconds=self.plan_monitor_interval_seconds,
             )
 
     async def close(self) -> None:
@@ -149,6 +299,8 @@ class TradingAlertBot:
             await self.market_stream.stop()
         if self.user_stream:
             await self.user_stream.stop()
+        if self.plan_monitor:
+            await self.plan_monitor.stop()
         if self.command_bot:
             await self.command_bot.close()
         if self.tasks:
@@ -426,6 +578,8 @@ class TradingAlertBot:
         ]
         if self.scanner is not None:
             self.tasks.append(asyncio.create_task(self.scanner.run()))
+        if self.plan_monitor is not None:
+            self.tasks.append(asyncio.create_task(self.plan_monitor.run()))
 
         if self.binance_private_account_sync:
             self.user_stream = BinanceUserDataStream(
@@ -442,9 +596,110 @@ class TradingAlertBot:
 
         await asyncio.gather(*self.tasks)
 
+    async def build_plan_for_signal(
+        self,
+        *,
+        symbol: str,
+        quality_payload: dict,
+        current_price: float,
+        structure_m15: dict,
+        source_alert_id: str | None = None,
+        study_mode: bool = False,
+    ) -> int | None:
+        if not self.trade_planner_enabled:
+            return None
+        assert self.storage is not None
+        plan = build_trade_plan(
+            symbol=symbol,
+            quality_payload=quality_payload,
+            current_price=current_price,
+            structure_m15=structure_m15,
+            expire_minutes=self.plan_expire_minutes,
+            min_rr_tp1=self.plan_min_rr_tp1,
+            atr_buffer_mult=self.plan_atr_buffer_mult,
+            use_fib=self.plan_use_fib,
+            use_order_blocks=self.plan_use_order_blocks,
+            study_mode=study_mode,
+        )
+        if plan is None:
+            self.logger.info("plan skipped reason | symbol=%s signal_type=%s", symbol, quality_payload.get("signal_type"))
+            return None
+        payload = trade_plan_to_dict(plan)
+        payload["source_alert_id"] = source_alert_id
+        plan_id = await self.storage.create_trade_plan(payload)
+        self.logger.info("plan created | id=%s symbol=%s type=%s", plan_id, symbol, payload.get("signal_type"))
+        return plan_id
+
+    async def handle_scanner_signal_sent(self, event) -> None:
+        metadata = event.metadata or {}
+        quality = metadata.get("quality_payload")
+        structure = metadata.get("structure_m15")
+        if not isinstance(quality, dict) or not isinstance(structure, dict):
+            metadata["plan_created"] = False
+            metadata["plan_block_reason"] = "datos insuficientes"
+            return
+        allowed, reason = evaluate_plan_gate(
+            planner_enabled=self.trade_planner_enabled,
+            quality_payload=quality,
+            structure_m15=structure,
+        )
+        metadata["auto_plan_allowed"] = allowed
+        metadata["plan_block_reason"] = reason
+        metadata["plan_created"] = False
+        if not allowed:
+            return
+        plan_id = await self.build_plan_for_signal(
+            symbol=event.symbol,
+            quality_payload=quality,
+            current_price=float(event.current_price or 0.0),
+            structure_m15=structure,
+            source_alert_id=event.key,
+        )
+        if plan_id is not None:
+            metadata["plan_created"] = True
+            metadata["plan_id"] = plan_id
+            metadata["plan_block_reason"] = "OK"
+            if self.storage is not None:
+                plan = await self.storage.get_trade_plan(plan_id)
+                if plan is not None:
+                    metadata["plan_payload"] = {
+                        "entry_low": float(plan["entry_low"]),
+                        "entry_high": float(plan["entry_high"]),
+                        "stop_loss": float(plan["stop_loss"]),
+                        "tp1": float(plan["tp1"]),
+                        "tp2": float(plan["tp2"]),
+                        "tp3": float(plan["tp3"]),
+                        "rr_tp1": float(plan["rr_tp1"]),
+                        "rr_tp2": float(plan["rr_tp2"]),
+                        "rr_tp3": float(plan["rr_tp3"]),
+                    }
+            await self._dispatch_alerts(
+                [
+                    self.alert_engine.build_system_alert(
+                        key=f"plan_created_{event.symbol.lower()}_{plan_id}",
+                        reason=f"Plan sugerido creado para {event.symbol} (#{plan_id}).",
+                        priority=AlertPriority.INFO,
+                        note=event.note,
+                    )
+                ]
+            )
+        else:
+            metadata["plan_block_reason"] = "RR insuficiente / datos insuficientes / precio lejos de entrada ideal"
+
 
 async def async_main() -> None:
     root_dir = Path(__file__).resolve().parents[1]
+    lock = SingleInstanceLock(root_dir / "runtime" / "bot.lock")
+    logger = logging.getLogger("trading_alert_bot")
+    try:
+        lock.acquire()
+        if lock.last_stale_pid is not None:
+            logger.warning("stale lock removed pid=%s", lock.last_stale_pid)
+        logger.info("single instance lock acquired pid=%s", os.getpid())
+    except SingleInstanceError as exc:
+        logger.error("%s. Abortando nueva instancia.", exc)
+        return
+
     bot = TradingAlertBot(root_dir)
     try:
         await bot.initialize()
@@ -459,6 +714,8 @@ async def async_main() -> None:
         raise
     finally:
         await bot.close()
+        lock.release()
+        logger.info("single instance lock released")
 
 
 def main() -> None:
