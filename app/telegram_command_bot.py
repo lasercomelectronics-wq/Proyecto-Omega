@@ -30,6 +30,7 @@ from app.strategy_engine import (
 from app.structure import analyze_structure
 from app.trade_manager import TradeManager
 from app.storage import Storage
+from app.scanner import evaluate_auto_alert_gate
 
 MessageSender = Callable[[str, str], Awaitable[None]]
 StatusProvider = Callable[[], dict[str, Any]]
@@ -94,6 +95,12 @@ class TelegramCommandBot:
         pullback_tolerance_mode: str = "atr",
         pullback_atr_mult: float = 0.25,
         pullback_pct: float = 0.15,
+        scanner_alert_low_quality: bool = False,
+        scanner_alert_momentum_chase: bool = False,
+        scanner_min_quality: str = "MEDIA",
+        scanner_require_adx_not_weak: bool = True,
+        scanner_require_structure_confirmation: bool = False,
+        scanner_block_dry_volume: bool = True,
     ) -> None:
         if not bot_token:
             raise TelegramCommandBotError("TELEGRAM_BOT_TOKEN no configurado.")
@@ -123,6 +130,12 @@ class TelegramCommandBot:
         self._pullback_tolerance_mode = pullback_tolerance_mode
         self._pullback_atr_mult = pullback_atr_mult
         self._pullback_pct = pullback_pct
+        self._scanner_alert_low_quality = scanner_alert_low_quality
+        self._scanner_alert_momentum_chase = scanner_alert_momentum_chase
+        self._scanner_min_quality = scanner_min_quality
+        self._scanner_require_adx_not_weak = scanner_require_adx_not_weak
+        self._scanner_require_structure_confirmation = scanner_require_structure_confirmation
+        self._scanner_block_dry_volume = scanner_block_dry_volume
         self._offset: int | None = None
         self._sessions: dict[str, ChatSession] = {}
         self._stop_event = asyncio.Event()
@@ -876,6 +889,16 @@ class TelegramCommandBot:
                 sqzmom_m15=sqz,
                 structure_by_tf=structure_by_tf if self._structure_enabled else None,
             )
+            auto_alert_allowed, auto_alert_block_reason = evaluate_auto_alert_gate(
+                quality=quality,
+                structure_m15=structure_by_tf.get("15m", {}),
+                min_quality=self._scanner_min_quality,
+                allow_low_quality=self._scanner_alert_low_quality,
+                allow_momentum_chase=self._scanner_alert_momentum_chase,
+                require_adx_not_weak=self._scanner_require_adx_not_weak,
+                require_structure_confirmation=self._scanner_require_structure_confirmation,
+                block_dry_volume=self._scanner_block_dry_volume,
+            )
         except Exception as exc:
             self._logger.warning("No se pudo calcular /debug_signal para %s: %s", symbol, exc)
             await self._send_message(chat_id, f"No pude calcular /debug_signal para {symbol}. Motivo: {exc}")
@@ -889,6 +912,8 @@ class TelegramCommandBot:
             f"quality: {quality.get('quality', 'BAJA')}",
             f"score: {quality.get('score_total', quality.get('score', 0))}",
             f"alert_allowed: {str(bool(quality.get('alert_allowed', False))).lower()}",
+            f"auto_alert_allowed: {str(auto_alert_allowed).lower()}",
+            f"auto_alert_block_reason: {auto_alert_block_reason}",
             "",
             "Sync:",
             f"M15 {tf_icons[tf_directions['15m']]} | M5 {tf_icons[tf_directions['5m']]} | M3 {tf_icons[tf_directions['3m']]} | M1 {tf_icons[tf_directions['1m']]}",

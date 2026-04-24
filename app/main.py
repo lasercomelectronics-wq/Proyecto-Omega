@@ -78,6 +78,12 @@ class TradingAlertBot:
         self.pullback_tolerance_mode = "atr"
         self.pullback_atr_mult = 0.25
         self.pullback_pct = 0.15
+        self.scanner_alert_low_quality = False
+        self.scanner_alert_momentum_chase = False
+        self.scanner_min_quality = "MEDIA"
+        self.scanner_require_adx_not_weak = True
+        self.scanner_require_structure_confirmation = False
+        self.scanner_block_dry_volume = True
         self.latest_prices: dict[str, PriceUpdate] = {}
         self.trade_planner_enabled = True
         self.plan_monitor_enabled = True
@@ -143,6 +149,12 @@ class TradingAlertBot:
         self.pullback_tolerance_mode = os.getenv("PULLBACK_TOLERANCE_MODE", "atr").strip().lower() or "atr"
         self.pullback_atr_mult = _env_float("PULLBACK_ATR_MULT", 0.25)
         self.pullback_pct = _env_float("PULLBACK_PCT", 0.15)
+        self.scanner_alert_low_quality = _env_flag("SCANNER_ALERT_LOW_QUALITY", False)
+        self.scanner_alert_momentum_chase = _env_flag("SCANNER_ALERT_MOMENTUM_CHASE", False)
+        self.scanner_min_quality = (os.getenv("SCANNER_MIN_QUALITY", "MEDIA").strip().upper() or "MEDIA")
+        self.scanner_require_adx_not_weak = _env_flag("SCANNER_REQUIRE_ADX_NOT_WEAK", True)
+        self.scanner_require_structure_confirmation = _env_flag("SCANNER_REQUIRE_STRUCTURE_CONFIRMATION", False)
+        self.scanner_block_dry_volume = _env_flag("SCANNER_BLOCK_DRY_VOLUME", True)
         self.trade_planner_enabled = _env_flag("TRADE_PLANNER_ENABLED", True)
         self.plan_monitor_enabled = _env_flag("PLAN_MONITOR_ENABLED", True)
         self.plan_monitor_interval_seconds = _env_int("PLAN_MONITOR_INTERVAL_SECONDS", 15)
@@ -188,6 +200,12 @@ class TradingAlertBot:
             pullback_tolerance_mode=self.pullback_tolerance_mode,
             pullback_atr_mult=self.pullback_atr_mult,
             pullback_pct=self.pullback_pct,
+            scanner_alert_low_quality=self.scanner_alert_low_quality,
+            scanner_alert_momentum_chase=self.scanner_alert_momentum_chase,
+            scanner_min_quality=self.scanner_min_quality,
+            scanner_require_adx_not_weak=self.scanner_require_adx_not_weak,
+            scanner_require_structure_confirmation=self.scanner_require_structure_confirmation,
+            scanner_block_dry_volume=self.scanner_block_dry_volume,
         )
         if self.scanner_enabled:
             self.scanner = SignalScanner(
@@ -204,6 +222,12 @@ class TradingAlertBot:
                 pullback_tolerance_mode=self.pullback_tolerance_mode,
                 pullback_atr_mult=self.pullback_atr_mult,
                 pullback_pct=self.pullback_pct,
+                alert_low_quality=self.scanner_alert_low_quality,
+                alert_momentum_chase=self.scanner_alert_momentum_chase,
+                min_quality=self.scanner_min_quality,
+                require_adx_not_weak=self.scanner_require_adx_not_weak,
+                require_structure_confirmation=self.scanner_require_structure_confirmation,
+                block_dry_volume=self.scanner_block_dry_volume,
                 on_signal_sent=self.handle_scanner_signal_sent,
             )
         if self.plan_monitor_enabled:

@@ -22,6 +22,75 @@ from app.trade_manager import TradeManager
 DispatchAlerts = Callable[[list[AlertEvent]], Awaitable[int]]
 SignalSentCallback = Callable[[AlertEvent], Awaitable[None]]
 
+QUALITY_ORDER = {"BAJA": 1, "MEDIA": 2, "ALTA": 3, "MUY_ALTA": 4}
+DEFAULT_ALLOWED_SIGNAL_TYPES = {
+    "LONG_PULLBACK",
+    "SHORT_PULLBACK",
+    "LONG_CONTINUATION",
+    "SHORT_CONTINUATION",
+    "LONG_REVERSAL_EARLY",
+    "SHORT_REVERSAL_EARLY",
+}
+
+
+def evaluate_auto_alert_gate(
+    *,
+    quality: dict[str, object],
+    structure_m15: dict[str, object] | None,
+    min_quality: str = "MEDIA",
+    allow_low_quality: bool = False,
+    allow_momentum_chase: bool = False,
+    require_adx_not_weak: bool = True,
+    require_structure_confirmation: bool = False,
+    block_dry_volume: bool = True,
+) -> tuple[bool, str]:
+    if not bool(quality.get("alert_allowed", False)):
+        return False, "ALERT_ALLOWED_FALSE"
+
+    signal_type = str(quality.get("signal_type", "SIN_SEÑAL"))
+    quality_label = str(quality.get("quality", "BAJA"))
+    adx_state = str(quality.get("adx_human", {}).get("state", ""))
+    kon_state = str(quality.get("koncorde_human", {}).get("state", ""))
+    direction = str(quality.get("result", "SIN_SEÑAL"))
+    choch = str((structure_m15 or {}).get("choch", "NONE"))
+
+    if signal_type in {"SIN_SEÑAL", "CONFLICT"}:
+        return False, signal_type
+    if signal_type == "MOMENTUM_CHASE" and not allow_momentum_chase:
+        return False, "MOMENTUM_CHASE_DISABLED"
+    if signal_type not in DEFAULT_ALLOWED_SIGNAL_TYPES and signal_type != "MOMENTUM_CHASE":
+        return False, "SIGNAL_TYPE_BLOCKED"
+
+    if not allow_low_quality:
+        threshold = QUALITY_ORDER.get(min_quality.upper(), QUALITY_ORDER["MEDIA"])
+        current = QUALITY_ORDER.get(quality_label.upper(), QUALITY_ORDER["BAJA"])
+        if current < threshold:
+            return False, "LOW_QUALITY"
+
+    if require_adx_not_weak and adx_state in {"ADX_WEAK", "ADX_CONTRARY"}:
+        return False, "ADX_WEAK"
+
+    if block_dry_volume and kon_state == "DRY_VOLUME":
+        return False, "DRY_VOLUME"
+    if kon_state == "CONTRARY":
+        return False, "KONCORDE_CONTRARY"
+
+    if signal_type.endswith("REVERSAL_EARLY"):
+        if direction == "LONG" and choch == "BEAR":
+            return False, "REVERSAL_CHOCH_CONTRA"
+        if direction == "SHORT" and choch == "BULL":
+            return False, "REVERSAL_CHOCH_CONTRA"
+
+    structure = structure_m15 or {}
+    bos_ok = str(structure.get("bos")) in {"BULL", "BEAR"}
+    pullback_ok = str(structure.get("pullback")) in {"LONG", "SHORT"}
+    if str(structure.get("bias", "MIX")) == "MIX" and not bos_ok and not pullback_ok:
+        return False, "NO_STRUCTURE_CONFIRMATION"
+    if require_structure_confirmation and (not bos_ok or not pullback_ok):
+        return False, "NO_STRUCTURE_CONFIRMATION"
+
+    return True, "OK"
+
 
 @dataclass(slots=True)
 class ScannerSignal:
@@ -49,6 +118,12 @@ class SignalScanner:
         pullback_tolerance_mode: str = "atr",
         pullback_atr_mult: float = 0.25,
         pullback_pct: float = 0.15,
+        alert_low_quality: bool = False,
+        alert_momentum_chase: bool = False,
+        min_quality: str = "MEDIA",
+        require_adx_not_weak: bool = True,
+        require_structure_confirmation: bool = False,
+        block_dry_volume: bool = True,
         on_signal_sent: SignalSentCallback | None = None,
     ) -> None:
         self._binance_client = binance_client
@@ -64,6 +139,12 @@ class SignalScanner:
         self._pullback_tolerance_mode = pullback_tolerance_mode
         self._pullback_atr_mult = pullback_atr_mult
         self._pullback_pct = pullback_pct
+        self._alert_low_quality = alert_low_quality
+        self._alert_momentum_chase = alert_momentum_chase
+        self._min_quality = min_quality.upper()
+        self._require_adx_not_weak = require_adx_not_weak
+        self._require_structure_confirmation = require_structure_confirmation
+        self._block_dry_volume = block_dry_volume
         self._on_signal_sent = on_signal_sent
         self._stop_event = asyncio.Event()
         self._running = False
@@ -118,6 +199,23 @@ class SignalScanner:
                 if await self._storage.has_scanner_alert_state(signal.event.key):
                     self._logger.info("Scanner skip cooldown: %s", signal.event.key)
                     continue
+                metadata = signal.event.metadata or {}
+                quality_payload = metadata.get("quality_payload")
+                structure_m15 = metadata.get("structure_m15")
+                if isinstance(quality_payload, dict):
+                    allowed, reason = evaluate_auto_alert_gate(
+                        quality=quality_payload,
+                        structure_m15=structure_m15 if isinstance(structure_m15, dict) else {},
+                        min_quality=self._min_quality,
+                        allow_low_quality=self._alert_low_quality,
+                        allow_momentum_chase=self._alert_momentum_chase,
+                        require_adx_not_weak=self._require_adx_not_weak,
+                        require_structure_confirmation=self._require_structure_confirmation,
+                        block_dry_volume=self._block_dry_volume,
+                    )
+                    if not allowed:
+                        self._logger.info("skip alert: %s | symbol=%s type=%s quality=%s", reason, symbol, quality_payload.get("signal_type"), quality_payload.get("quality"))
+                        continue
 
                 self._logger.info(
                     "Scanner señal detectada: %s %s %s",
@@ -355,7 +453,7 @@ class SignalScanner:
         structure_m15: dict[str, str | bool | float | None],
     ) -> ScannerSignal:
         side = TradeSide.LONG if direction == "LONG" else TradeSide.SHORT
-        header_icon = "🟢🔥" if direction == "LONG" else "🔴🔥"
+        header_icon = "🟢" if direction == "LONG" else "🔴"
         signal_type = str(quality.get("signal_type", f"{direction}_CONTINUATION"))
         level_text = {
             "SYNC_3_4": f"{signal_type} sync 3/4",
@@ -371,32 +469,22 @@ class SignalScanner:
 
         note = "\n".join(
             [
-                f"{header_icon} {symbol} — {level_text}",
+                "⚠️ Señal detectada",
                 "",
+                f"Símbolo: {symbol}",
+                f"Tipo: {signal_type}",
+                f"Side: {direction}",
+                f"Calidad: {quality['quality']}",
                 f"Precio: {float(m15_ema['close']):.6f} USDT",
                 "",
-                "Estructura M15:",
-                f"{'🟢' if structure_m15.get('bias') == 'BULL' else ('🔴' if structure_m15.get('bias') == 'BEAR' else '🟡')} {structure_m15.get('bias', 'MIX')} | "
-                f"{'HH/HL' if structure_m15.get('bias') == 'BULL' else ('LL/LH' if structure_m15.get('bias') == 'BEAR' else 'MIX')} | "
-                f"BOS {'✅' if str(structure_m15.get('bos')) == expected_bias else '❌'} | "
-                f"Pullback {'✅' if str(structure_m15.get('pullback')) == direction else '❌'}",
+                "Lectura:",
+                f"- Nivel: {level_text}",
+                f"- Estructura M15: {structure_m15.get('bias', 'MIX')} | BOS {'✅' if str(structure_m15.get('bos')) == expected_bias else '❌'} | Pullback {'✅' if str(structure_m15.get('pullback')) == direction else '❌'}",
+                f"- Momentum TF: M15 {tf_rows['15m'].split()[1]} | M5 {tf_rows['5m'].split()[1]} | M3 {tf_rows['3m'].split()[1]} | M1 {tf_rows['1m'].split()[1]}",
+                f"- MAs: {header_icon} {m15_ema['relation']} | cruce {cross_text}",
+                f"- ADX: {quality.get('adx_human', {}).get('status', '🟡 sin lectura')}",
+                f"- Flujo: {quality.get('koncorde_human', {}).get('status', '🟡 flujo neutral')}",
                 "",
-                "Momentum:",
-                f"M15 {tf_rows['15m'].split()[1]} | M5 {tf_rows['5m'].split()[1]} | M3 {tf_rows['3m'].split()[1]} | M1 {tf_rows['1m'].split()[1]}",
-                "",
-                "MAs:",
-                f"{m15_ema['icon']} {m15_ema['relation']}",
-                "",
-                "📐 ADX:",
-                f"{quality.get('adx_human', {}).get('status', '🟡 sin lectura')} | {quality.get('adx_human', {}).get('data', '-')}",
-                "",
-                "🧬 Flujo:",
-                f"{quality.get('koncorde_human', {}).get('status', '🟡 flujo neutral')} | {quality.get('koncorde_human', {}).get('data', '-')}",
-                "",
-                "🧠 Lectura:",
-                *[str(line) for line in quality.get("human_report", [])[:3]],
-                "",
-                f"🎯 {quality['quality']} | score {quality.get('score_total', quality['score'])}",
                 "⚠ Solo alerta. No orden.",
             ]
         )
