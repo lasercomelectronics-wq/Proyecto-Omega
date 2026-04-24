@@ -27,12 +27,15 @@ from app.strategy_engine import (
     analyze_sqzmom,
     evaluate_signal_quality,
 )
+from app.structure import analyze_structure
 from app.trade_manager import TradeManager
+from app.storage import Storage
 
 MessageSender = Callable[[str, str], Awaitable[None]]
 StatusProvider = Callable[[], dict[str, Any]]
 TradeChangeCallback = Callable[[str | None], Awaitable[None]]
 CurrentPriceProvider = Callable[[str], Awaitable[tuple[float, str, int | None] | None]]
+PlanBuilder = Callable[..., Awaitable[int | None]]
 
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{2,20}$")
 TIMEFRAME_PATTERN = re.compile(r"^\d+[mhdwM]$", re.IGNORECASE)
@@ -78,6 +81,19 @@ class TelegramCommandBot:
         timeout_seconds: float = 15.0,
         polling_timeout_seconds: int = 20,
         sender: MessageSender | None = None,
+        storage: Storage | None = None,
+        plan_builder: PlanBuilder | None = None,
+        plan_expire_minutes: int = 120,
+        plan_use_fib: bool = True,
+        plan_use_order_blocks: bool = True,
+        plan_min_rr_tp1: float = 1.0,
+        plan_atr_buffer_mult: float = 0.25,
+        structure_enabled: bool = True,
+        structure_timeframes: tuple[str, ...] = ("15m", "5m", "3m"),
+        pivot_window: int = 3,
+        pullback_tolerance_mode: str = "atr",
+        pullback_atr_mult: float = 0.25,
+        pullback_pct: float = 0.15,
     ) -> None:
         if not bot_token:
             raise TelegramCommandBotError("TELEGRAM_BOT_TOKEN no configurado.")
@@ -94,6 +110,19 @@ class TelegramCommandBot:
         self._on_trade_changed = on_trade_changed
         self._polling_timeout_seconds = polling_timeout_seconds
         self._sender_override = sender
+        self._storage = storage
+        self._plan_builder = plan_builder
+        self._plan_expire_minutes = plan_expire_minutes
+        self._plan_use_fib = plan_use_fib
+        self._plan_use_order_blocks = plan_use_order_blocks
+        self._plan_min_rr_tp1 = plan_min_rr_tp1
+        self._plan_atr_buffer_mult = plan_atr_buffer_mult
+        self._structure_enabled = structure_enabled
+        self._structure_timeframes = tuple(structure_timeframes)
+        self._pivot_window = max(2, int(pivot_window))
+        self._pullback_tolerance_mode = pullback_tolerance_mode
+        self._pullback_atr_mult = pullback_atr_mult
+        self._pullback_pct = pullback_pct
         self._offset: int | None = None
         self._sessions: dict[str, ChatSession] = {}
         self._stop_event = asyncio.Event()
@@ -338,6 +367,12 @@ class TelegramCommandBot:
             "/consulta": self._handle_consulta,
             "/renderizar": self._handle_renderizar,
             "/signal": self._handle_signal,
+            "/debug_signal": self._handle_debug_signal,
+            "/debug": self._handle_debug_signal,
+            "/plan": self._handle_plan,
+            "/plans": self._handle_plans,
+            "/plan_status": self._handle_plan_status,
+            "/cancel_plan": self._handle_cancel_plan,
         }
         handler = handlers.get(command)
         if handler is None:
@@ -375,6 +410,9 @@ class TelegramCommandBot:
                     "/consulta precio BTC",
                     "/renderizar BTCUSDT 1m",
                     "/signal BTC",
+                    "/debug_signal BTC",
+                    "/plan BTC",
+                    "/plans",
                     "",
                     "📡 Watchlist:",
                     "/watchlist",
@@ -655,6 +693,7 @@ class TelegramCommandBot:
             macd = None
             sqz = None
             koncorde_line = ""
+            structure_by_tf: dict[str, dict[str, str | bool | float | None]] = {}
             for interval, label in (("15m", "M15"), ("5m", "M5 "), ("3m", "M3 "), ("1m", "M1 ")):
                 candles = await self._binance_client.get_klines(symbol, interval=interval, limit=210)
                 result = analyze_ema_signal(candles, fast_period=55, slow_period=200)
@@ -674,6 +713,25 @@ class TelegramCommandBot:
                         f"{koncorde['icon']} {koncorde['text']} | "
                         f"RSI {koncorde['rsi']:.1f} | Vol {koncorde['volume_ratio']:.2f}x"
                     )
+                if self._structure_enabled and interval in self._structure_timeframes:
+                    try:
+                        structure_by_tf[interval] = analyze_structure(
+                            candles,
+                            pivot_window=self._pivot_window,
+                            pullback_tolerance_mode=self._pullback_tolerance_mode,
+                            pullback_atr_mult=self._pullback_atr_mult,
+                            pullback_pct=self._pullback_pct,
+                            logger=self._logger,
+                        )
+                    except Exception as exc:
+                        self._logger.warning("Structure error /signal %s %s: %s", symbol, interval, exc)
+                        structure_by_tf[interval] = {
+                            "bias": "MIX",
+                            "bos": "NONE",
+                            "choch": "NONE",
+                            "pullback": "NONE",
+                            "summary": "error estructura",
+                        }
             assert m15_result is not None and koncorde is not None and adx is not None and macd is not None and sqz is not None
             quality = evaluate_signal_quality(
                 tf_directions=tf_directions,
@@ -682,6 +740,7 @@ class TelegramCommandBot:
                 adx_m15=adx,
                 macd_m15=macd,
                 sqzmom_m15=sqz,
+                structure_by_tf=structure_by_tf if self._structure_enabled else None,
             )
         except Exception as exc:
             self._logger.warning("No se pudo calcular /signal para %s: %s", symbol, exc)
@@ -702,6 +761,7 @@ class TelegramCommandBot:
         lines.extend(
             [
                 f"Resultado: {result_icon} {quality['result']}",
+                f"Tipo: {quality.get('signal_type', 'SIN_SEÑAL')}",
                 "",
                 "Sync:",
                 f"M15 {tf_icons[tf_directions['15m']]}",
@@ -715,11 +775,282 @@ class TelegramCommandBot:
                 "Koncorde Lite:",
                 koncorde_line,
                 "",
+                "📐 ADX/DMI:",
+                str(quality.get("adx_human", {}).get("status", "🟡 Sin lectura ADX")),
+                f"Lectura: {quality.get('adx_human', {}).get('reading', 'Sin lectura')}",
+                f"Datos: {quality.get('adx_human', {}).get('data', '-')}",
+                f"Impacto: {quality.get('adx_human', {}).get('impact_score', 0)} score | filtro {quality.get('adx_human', {}).get('filtro', 'neutral')}",
+                "",
+                "🧬 Koncorde Lite M15:",
+                str(quality.get("koncorde_human", {}).get("status", "🟡 Flujo neutral")),
+                f"Lectura: {quality.get('koncorde_human', {}).get('reading', 'Sin lectura')}",
+                f"Datos: {quality.get('koncorde_human', {}).get('data', '-')}",
+                f"Impacto: {quality.get('koncorde_human', {}).get('impact_score', 0)} score | filtro {quality.get('koncorde_human', {}).get('filtro', 'neutral')}",
+                "",
+                "Estructura M15:",
+                (
+                    f"{'🟢' if structure_by_tf.get('15m', {}).get('bias') == 'BULL' else ('🔴' if structure_by_tf.get('15m', {}).get('bias') == 'BEAR' else '🟡')} "
+                    f"{structure_by_tf.get('15m', {}).get('bias', 'MIX')}"
+                ),
+                f"Último high > anterior {'✅' if bool(structure_by_tf.get('15m', {}).get('hh')) else '❌'}",
+                f"Último low > anterior {'✅' if bool(structure_by_tf.get('15m', {}).get('hl')) else '❌'}",
+                f"Último high < anterior {'✅' if bool(structure_by_tf.get('15m', {}).get('lh')) else '❌'}",
+                f"Último low < anterior {'✅' if bool(structure_by_tf.get('15m', {}).get('ll')) else '❌'}",
+                f"BOS: {structure_by_tf.get('15m', {}).get('bos', 'NONE')}",
+                f"CHoCH: {structure_by_tf.get('15m', {}).get('choch', 'NONE')}",
+                f"Pullback: {structure_by_tf.get('15m', {}).get('pullback', 'NONE')}",
+                f"Lectura: {structure_by_tf.get('15m', {}).get('summary', 'estructura mixta')}",
+                "",
                 "Calidad:",
                 f"🎯 {quality['quality']} | score {quality['score']}",
+                f"🧠 {quality.get('structure_notes', 'sin ajuste estructura')}",
+                f"⚠ Riesgo: {'momentum chase/riesgo alto' if quality.get('chase_risk') == 'high' else 'pullback/sync más limpio'}",
+                "Warnings:",
+                *(
+                    [f"- {item}" for item in quality.get("degraders", [])]
+                    if quality.get("degraders")
+                    else ["- ninguno"]
+                ),
+                *(
+                    [f"Reason: {quality.get('no_signal_reason')}"]
+                    if quality.get("no_signal_reason")
+                    else []
+                ),
+                "",
+                "🧠 Lectura humana:",
+                *[str(line) for line in quality.get("human_report", [])],
             ]
         )
         await self._send_message(chat_id, "\n".join(lines))
+
+    async def _handle_debug_signal(self, chat_id: str, args: str) -> None:
+        raw = args.strip()
+        if not raw:
+            raise ValueError("Uso:\n/debug_signal BTC\n/debug BTC")
+        if self._binance_client is None:
+            await self._send_message(chat_id, "No pude calcular /debug_signal. Cliente de Binance no disponible.")
+            return
+
+        symbol = self._normalize_futures_symbol(raw.split()[0])
+        try:
+            tf_icons = {"LONG": "🟢", "SHORT": "🔴", "NONE": "⚪"}
+            tf_directions: dict[str, str] = {}
+            m15_result = None
+            koncorde = None
+            adx = None
+            macd = None
+            sqz = None
+            structure_by_tf: dict[str, dict[str, str | bool | float | None]] = {}
+            for interval in ("15m", "5m", "3m", "1m"):
+                candles = await self._binance_client.get_klines(symbol, interval=interval, limit=210)
+                result = analyze_ema_signal(candles, fast_period=55, slow_period=200)
+                direction = "NONE"
+                if result["trend"] == "BULL":
+                    direction = "LONG"
+                elif result["trend"] == "BEAR":
+                    direction = "SHORT"
+                tf_directions[interval] = direction
+                if interval == "15m":
+                    m15_result = result
+                    koncorde = analyze_koncorde_lite(candles)
+                    adx = analyze_adx_dmi(candles)
+                    macd = analyze_macd([candle.close for candle in candles[:-1]])
+                    sqz = analyze_sqzmom(candles)
+                if self._structure_enabled and interval in self._structure_timeframes:
+                    structure_by_tf[interval] = analyze_structure(
+                        candles,
+                        pivot_window=self._pivot_window,
+                        pullback_tolerance_mode=self._pullback_tolerance_mode,
+                        pullback_atr_mult=self._pullback_atr_mult,
+                        pullback_pct=self._pullback_pct,
+                        logger=self._logger,
+                    )
+
+            assert m15_result is not None and koncorde is not None and adx is not None and macd is not None and sqz is not None
+            quality = evaluate_signal_quality(
+                tf_directions=tf_directions,
+                m15_ema=m15_result,
+                koncorde_m15=koncorde,
+                adx_m15=adx,
+                macd_m15=macd,
+                sqzmom_m15=sqz,
+                structure_by_tf=structure_by_tf if self._structure_enabled else None,
+            )
+        except Exception as exc:
+            self._logger.warning("No se pudo calcular /debug_signal para %s: %s", symbol, exc)
+            await self._send_message(chat_id, f"No pude calcular /debug_signal para {symbol}. Motivo: {exc}")
+            return
+
+        lines = [
+            f"🧪 DEBUG {symbol}",
+            "",
+            "Resultado:",
+            f"type: {quality.get('signal_type', 'SIN_SEÑAL')}",
+            f"quality: {quality.get('quality', 'BAJA')}",
+            f"score: {quality.get('score_total', quality.get('score', 0))}",
+            f"alert_allowed: {str(bool(quality.get('alert_allowed', False))).lower()}",
+            "",
+            "Sync:",
+            f"M15 {tf_icons[tf_directions['15m']]} | M5 {tf_icons[tf_directions['5m']]} | M3 {tf_icons[tf_directions['3m']]} | M1 {tf_icons[tf_directions['1m']]}",
+            "",
+            "Score +:",
+            *([str(item) for item in quality.get("score_items", [])] or ["none"]),
+            "",
+            "Penalties:",
+            *([str(item) for item in quality.get("penalties", [])] or ["none"]),
+            "",
+            "Blockers:",
+            *([str(item) for item in quality.get("blockers", [])] or ["none"]),
+            "",
+            "Degraders:",
+            *([str(item) for item in quality.get("degraders", [])] or ["none"]),
+            "",
+            f"Reason: {quality.get('no_signal_reason', '') or 'n/a'}",
+        ]
+        await self._send_message(chat_id, "\n".join(lines))
+
+    async def _compute_signal_quality(self, symbol: str) -> tuple[dict[str, str], dict, dict]:
+        tf_directions: dict[str, str] = {}
+        m15_result = None
+        koncorde = None
+        adx = None
+        macd = None
+        sqz = None
+        structure_by_tf: dict[str, dict[str, str | bool | float | None]] = {}
+        assert self._binance_client is not None
+        for interval in ("15m", "5m", "3m", "1m"):
+            candles = await self._binance_client.get_klines(symbol, interval=interval, limit=210)
+            result = analyze_ema_signal(candles, fast_period=55, slow_period=200)
+            direction = "NONE"
+            if result["trend"] == "BULL":
+                direction = "LONG"
+            elif result["trend"] == "BEAR":
+                direction = "SHORT"
+            tf_directions[interval] = direction
+            if interval == "15m":
+                m15_result = result
+                koncorde = analyze_koncorde_lite(candles)
+                adx = analyze_adx_dmi(candles)
+                macd = analyze_macd([candle.close for candle in candles[:-1]])
+                sqz = analyze_sqzmom(candles)
+            if self._structure_enabled and interval in self._structure_timeframes:
+                structure_by_tf[interval] = analyze_structure(
+                    candles,
+                    pivot_window=self._pivot_window,
+                    pullback_tolerance_mode=self._pullback_tolerance_mode,
+                    pullback_atr_mult=self._pullback_atr_mult,
+                    pullback_pct=self._pullback_pct,
+                    logger=self._logger,
+                )
+        assert m15_result is not None and koncorde is not None and adx is not None and macd is not None and sqz is not None
+        quality = evaluate_signal_quality(
+            tf_directions=tf_directions,
+            m15_ema=m15_result,
+            koncorde_m15=koncorde,
+            adx_m15=adx,
+            macd_m15=macd,
+            sqzmom_m15=sqz,
+            structure_by_tf=structure_by_tf if self._structure_enabled else None,
+        )
+        return tf_directions, quality, structure_by_tf
+
+    async def _handle_plan(self, chat_id: str, args: str) -> None:
+        raw = args.strip()
+        if not raw:
+            raise ValueError("Uso:\n/plan BTC")
+        if self._binance_client is None or self._plan_builder is None:
+            await self._send_message(chat_id, "Planner no disponible en este runtime.")
+            return
+        symbol = self._normalize_futures_symbol(raw.split()[0])
+        try:
+            _, quality, structure_by_tf = await self._compute_signal_quality(symbol)
+            current_price, _, _ = await self._get_price_snapshot(symbol)
+            plan_id = await self._plan_builder(
+                symbol=symbol,
+                quality_payload=quality,
+                current_price=current_price,
+                structure_m15=structure_by_tf.get("15m", {}),
+                study_mode=False,
+            )
+        except Exception as exc:
+            await self._send_message(chat_id, f"No pude crear plan para {symbol}. Motivo: {exc}")
+            return
+        if plan_id is None:
+            await self._send_message(
+                chat_id,
+                f"Plan omitido para {symbol}. Tipo={quality.get('signal_type','SIN_SEÑAL')} | reason={quality.get('no_signal_reason','n/a')}",
+            )
+            return
+        assert self._storage is not None
+        plan = await self._storage.get_trade_plan(plan_id)
+        assert plan is not None
+        await self._send_message(
+            chat_id,
+            "\n".join(
+                [
+                    f"🧭 {symbol} — Plan {plan['direction']} sugerido",
+                    "",
+                    f"Plan: #{plan_id} | Tipo: {plan['signal_type']} | Calidad: {plan['quality']}",
+                    f"Entrada ideal: {float(plan['entry_low']):.6f} - {float(plan['entry_high']):.6f}",
+                    f"SL: {float(plan['stop_loss']):.6f}",
+                    f"TP1: {float(plan['tp1']):.6f} | {float(plan['rr_tp1']):.2f}R",
+                    f"TP2: {float(plan['tp2']):.6f} | {float(plan['rr_tp2']):.2f}R",
+                    f"TP3: {float(plan['tp3']):.6f} | {float(plan['rr_tp3']):.2f}R",
+                    "⚠ Solo plan. No orden.",
+                ]
+            ),
+        )
+
+    async def _handle_plans(self, chat_id: str, _: str) -> None:
+        if self._storage is None:
+            await self._send_message(chat_id, "Storage no disponible.")
+            return
+        plans = await self._storage.list_open_trade_plans()
+        if not plans:
+            await self._send_message(chat_id, "No hay planes abiertos.")
+            return
+        lines = ["🧭 Planes abiertos:"]
+        for plan in plans[:20]:
+            lines.append(
+                f"#{plan['id']} {plan['symbol']} {plan['direction']} {plan['signal_type']} {plan['status']} [{float(plan['entry_low']):.4f}-{float(plan['entry_high']):.4f}]"
+            )
+        await self._send_message(chat_id, "\n".join(lines))
+
+    async def _handle_plan_status(self, chat_id: str, args: str) -> None:
+        if self._storage is None:
+            await self._send_message(chat_id, "Storage no disponible.")
+            return
+        raw = args.strip()
+        if not raw.isdigit():
+            raise ValueError("Uso:\n/plan_status <id>")
+        plan = await self._storage.get_trade_plan(int(raw))
+        if plan is None:
+            await self._send_message(chat_id, f"Plan #{raw} no encontrado.")
+            return
+        await self._send_message(
+            chat_id,
+            "\n".join(
+                [
+                    f"Plan #{plan['id']} | {plan['symbol']} {plan['direction']}",
+                    f"Tipo: {plan['signal_type']} | Calidad: {plan['quality']} | Estado: {plan['status']}",
+                    f"Entrada: {float(plan['entry_low']):.6f}-{float(plan['entry_high']):.6f}",
+                    f"SL: {float(plan['stop_loss']):.6f}",
+                    f"TP1/TP2/TP3: {float(plan['tp1']):.6f} / {float(plan['tp2']):.6f} / {float(plan['tp3']):.6f}",
+                    f"Expira: {plan['expires_at']}",
+                ]
+            ),
+        )
+
+    async def _handle_cancel_plan(self, chat_id: str, args: str) -> None:
+        if self._storage is None:
+            await self._send_message(chat_id, "Storage no disponible.")
+            return
+        raw = args.strip()
+        if not raw.isdigit():
+            raise ValueError("Uso:\n/cancel_plan <id>")
+        plan_id = int(raw)
+        await self._storage.update_trade_plan_status(plan_id, "CANCELLED")
+        await self._send_message(chat_id, f"Plan #{plan_id} cancelado. No se tocó Binance.")
 
     async def _handle_close(self, chat_id: str, args: str) -> None:
         symbol = self._parse_symbol_argument(args)

@@ -1,0 +1,198 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+
+ALLOWED_SIGNAL_TYPES = {
+    "LONG_PULLBACK",
+    "SHORT_PULLBACK",
+    "LONG_CONTINUATION",
+    "SHORT_CONTINUATION",
+    "LONG_REVERSAL_EARLY",
+    "SHORT_REVERSAL_EARLY",
+}
+
+
+@dataclass(slots=True)
+class TradePlan:
+    symbol: str
+    direction: str
+    signal_type: str
+    quality: str
+    current_price: float
+    entry_zone_low: float
+    entry_zone_high: float
+    stop_loss: float
+    tp1: float
+    tp2: float
+    tp3: float
+    rr_tp1: float
+    rr_tp2: float
+    rr_tp3: float
+    reasons: list[str]
+    warnings: list[str]
+    created_at: str
+    expires_at: str
+    status: str = "CREATED"
+
+
+def fib_retracement_zone(swing_high: float, swing_low: float, direction: str) -> dict[str, float]:
+    rng = abs(swing_high - swing_low)
+    if direction == "LONG":
+        return {
+            "0.5": swing_high - (rng * 0.5),
+            "0.618": swing_high - (rng * 0.618),
+            "0.705": swing_high - (rng * 0.705),
+        }
+    return {
+        "0.5": swing_low + (rng * 0.5),
+        "0.618": swing_low + (rng * 0.618),
+        "0.705": swing_low + (rng * 0.705),
+    }
+
+
+def fib_extensions(swing_high: float, swing_low: float, direction: str) -> dict[str, float]:
+    rng = abs(swing_high - swing_low)
+    if direction == "LONG":
+        return {
+            "1.272": swing_high + (rng * 0.272),
+            "1.618": swing_high + (rng * 0.618),
+            "2.0": swing_high + rng,
+        }
+    return {
+        "1.272": swing_low - (rng * 0.272),
+        "1.618": swing_low - (rng * 0.618),
+        "2.0": swing_low - rng,
+    }
+
+
+def detect_order_block(candles: list[dict[str, float]] | None, direction: str, bos_context: str) -> dict[str, float] | None:
+    if not candles or bos_context not in {"BULL", "BEAR"}:
+        return None
+    if direction == "LONG":
+        for candle in reversed(candles[:-1]):
+            if candle["close"] < candle["open"]:
+                return {"low": candle["low"], "high": candle["high"]}
+    else:
+        for candle in reversed(candles[:-1]):
+            if candle["close"] > candle["open"]:
+                return {"low": candle["low"], "high": candle["high"]}
+    return None
+
+
+def build_trade_plan(
+    *,
+    symbol: str,
+    quality_payload: dict[str, Any],
+    current_price: float,
+    structure_m15: dict[str, Any],
+    atr_value: float | None = None,
+    expire_minutes: int = 120,
+    min_rr_tp1: float = 1.0,
+    atr_buffer_mult: float = 0.25,
+    use_fib: bool = True,
+    use_order_blocks: bool = True,
+    study_mode: bool = False,
+) -> TradePlan | None:
+    signal_type = str(quality_payload.get("signal_type", "SIN_SEÑAL"))
+    direction = str(quality_payload.get("result", "SIN_SEÑAL"))
+    alert_allowed = bool(quality_payload.get("alert_allowed", False))
+
+    if not alert_allowed:
+        return None
+    if signal_type == "MOMENTUM_CHASE" and not study_mode:
+        return None
+    if signal_type in {"SIN_SEÑAL", "CONFLICT"}:
+        return None
+    if signal_type not in ALLOWED_SIGNAL_TYPES:
+        return None
+    if direction not in {"LONG", "SHORT"}:
+        return None
+
+    swing_high = float(structure_m15.get("last_high") or current_price * 1.01)
+    swing_low = float(structure_m15.get("last_low") or current_price * 0.99)
+    if swing_high <= swing_low:
+        swing_high = max(swing_high, current_price * 1.01)
+        swing_low = min(swing_low, current_price * 0.99)
+
+    retr = fib_retracement_zone(swing_high, swing_low, direction) if use_fib else {}
+    ext = fib_extensions(swing_high, swing_low, direction)
+
+    reasons = ["pullback pivot", "estructura M15"]
+    warnings: list[str] = []
+    ob = None
+    if use_order_blocks:
+        ob = detect_order_block(None, direction, str(structure_m15.get("bos", "NONE")))
+        if ob is not None:
+            reasons.append("order block")
+
+    if retr:
+        entry_candidates = [retr["0.5"], retr["0.618"], retr["0.705"]]
+        entry_zone_low = min(entry_candidates)
+        entry_zone_high = max(entry_candidates)
+        reasons.append("fib 0.5/0.618/0.705")
+    else:
+        spread = abs(swing_high - swing_low) * 0.2
+        entry_zone_low = current_price - spread
+        entry_zone_high = current_price + spread
+
+    atr = atr_value if atr_value is not None else (abs(swing_high - swing_low) * 0.2)
+    buffer = max(atr * atr_buffer_mult, current_price * 0.001)
+
+    if direction == "LONG":
+        stop_loss = (ob["low"] if ob else swing_low) - buffer
+        risk = max(1e-9, ((entry_zone_low + entry_zone_high) / 2) - stop_loss)
+        tp1 = max(((entry_zone_low + entry_zone_high) / 2) + risk, swing_high)
+        tp2 = max(((entry_zone_low + entry_zone_high) / 2) + (risk * 2), ext["1.272"])
+        tp3 = max(((entry_zone_low + entry_zone_high) / 2) + (risk * 3), ext["1.618"])
+        if current_price > entry_zone_high:
+            warnings.append("no perseguir si no toca entrada")
+    else:
+        stop_loss = (ob["high"] if ob else swing_high) + buffer
+        risk = max(1e-9, stop_loss - ((entry_zone_low + entry_zone_high) / 2))
+        tp1 = min(((entry_zone_low + entry_zone_high) / 2) - risk, swing_low)
+        tp2 = min(((entry_zone_low + entry_zone_high) / 2) - (risk * 2), ext["1.272"])
+        tp3 = min(((entry_zone_low + entry_zone_high) / 2) - (risk * 3), ext["1.618"])
+        if current_price < entry_zone_low:
+            warnings.append("no perseguir si no toca entrada")
+
+    entry_mid = (entry_zone_low + entry_zone_high) / 2
+    if direction == "LONG":
+        rr_tp1 = (tp1 - entry_mid) / max(1e-9, entry_mid - stop_loss)
+        rr_tp2 = (tp2 - entry_mid) / max(1e-9, entry_mid - stop_loss)
+        rr_tp3 = (tp3 - entry_mid) / max(1e-9, entry_mid - stop_loss)
+    else:
+        rr_tp1 = (entry_mid - tp1) / max(1e-9, stop_loss - entry_mid)
+        rr_tp2 = (entry_mid - tp2) / max(1e-9, stop_loss - entry_mid)
+        rr_tp3 = (entry_mid - tp3) / max(1e-9, stop_loss - entry_mid)
+
+    if rr_tp1 < min_rr_tp1:
+        warnings.append("TP1 < 1R, plan_quality baja")
+    if abs(stop_loss - entry_mid) / entry_mid > 0.03:
+        warnings.append("SL amplio")
+    if "REVERSAL_EARLY" in signal_type:
+        warnings.append("reversal temprano: requiere confirmación")
+
+    now = datetime.now(tz=timezone.utc)
+    return TradePlan(
+        symbol=symbol,
+        direction=direction,
+        signal_type=signal_type,
+        quality=str(quality_payload.get("quality", "BAJA")),
+        current_price=float(current_price),
+        entry_zone_low=float(entry_zone_low),
+        entry_zone_high=float(entry_zone_high),
+        stop_loss=float(stop_loss),
+        tp1=float(tp1),
+        tp2=float(tp2),
+        tp3=float(tp3),
+        rr_tp1=float(rr_tp1),
+        rr_tp2=float(rr_tp2),
+        rr_tp3=float(rr_tp3),
+        reasons=reasons,
+        warnings=warnings,
+        created_at=now.isoformat(),
+        expires_at=(now + timedelta(minutes=expire_minutes)).isoformat(),
+    )

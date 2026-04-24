@@ -163,6 +163,43 @@ class Storage:
                     closed_candle_time TEXT NOT NULL,
                     sent_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS trade_plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    signal_type TEXT NOT NULL,
+                    quality TEXT NOT NULL,
+                    entry_low REAL NOT NULL,
+                    entry_high REAL NOT NULL,
+                    stop_loss REAL NOT NULL,
+                    tp1 REAL NOT NULL,
+                    tp2 REAL NOT NULL,
+                    tp3 REAL NOT NULL,
+                    rr_tp1 REAL NOT NULL,
+                    rr_tp2 REAL NOT NULL,
+                    rr_tp3 REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    source_alert_id TEXT,
+                    raw_json TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_trade_plans_symbol_status
+                ON trade_plans(symbol, status, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS trade_plan_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plan_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    price REAL,
+                    created_at TEXT NOT NULL,
+                    sent_to_telegram INTEGER NOT NULL DEFAULT 0,
+                    raw_json TEXT,
+                    UNIQUE(plan_id, event_type),
+                    FOREIGN KEY (plan_id) REFERENCES trade_plans(id) ON DELETE CASCADE
+                );
                 """
             )
             self._connection.commit()
@@ -971,3 +1008,97 @@ class Storage:
                 ),
             )
             self._connection.commit()
+
+    async def create_trade_plan(self, plan: dict) -> int:
+        return await asyncio.to_thread(self._create_trade_plan_sync, plan)
+
+    def _create_trade_plan_sync(self, plan: dict) -> int:
+        with self._thread_lock:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO trade_plans (
+                    symbol, direction, signal_type, quality,
+                    entry_low, entry_high, stop_loss, tp1, tp2, tp3,
+                    rr_tp1, rr_tp2, rr_tp3, status,
+                    created_at, expires_at, source_alert_id, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    plan["symbol"],
+                    plan["direction"],
+                    plan["signal_type"],
+                    plan["quality"],
+                    float(plan["entry_zone_low"]),
+                    float(plan["entry_zone_high"]),
+                    float(plan["stop_loss"]),
+                    float(plan["tp1"]),
+                    float(plan["tp2"]),
+                    float(plan["tp3"]),
+                    float(plan["rr_tp1"]),
+                    float(plan["rr_tp2"]),
+                    float(plan["rr_tp3"]),
+                    plan.get("status", "CREATED"),
+                    plan["created_at"],
+                    plan["expires_at"],
+                    plan.get("source_alert_id"),
+                    json.dumps(plan),
+                ),
+            )
+            self._connection.commit()
+            return int(cursor.lastrowid)
+
+    async def list_trade_plans(self, statuses: tuple[str, ...] | None = None) -> list[dict]:
+        return await asyncio.to_thread(self._list_trade_plans_sync, statuses)
+
+    def _list_trade_plans_sync(self, statuses: tuple[str, ...] | None = None) -> list[dict]:
+        with self._thread_lock:
+            query = "SELECT * FROM trade_plans"
+            params: tuple[object, ...] = ()
+            if statuses:
+                placeholders = ", ".join("?" for _ in statuses)
+                query += f" WHERE status IN ({placeholders})"
+                params = tuple(statuses)
+            query += " ORDER BY created_at DESC"
+            rows = self._connection.execute(query, params).fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_trade_plan(self, plan_id: int) -> dict | None:
+        return await asyncio.to_thread(self._get_trade_plan_sync, plan_id)
+
+    def _get_trade_plan_sync(self, plan_id: int) -> dict | None:
+        with self._thread_lock:
+            row = self._connection.execute("SELECT * FROM trade_plans WHERE id = ?", (plan_id,)).fetchone()
+            return dict(row) if row is not None else None
+
+    async def update_trade_plan_status(self, plan_id: int, status: str) -> None:
+        await asyncio.to_thread(self._update_trade_plan_status_sync, plan_id, status)
+
+    def _update_trade_plan_status_sync(self, plan_id: int, status: str) -> None:
+        with self._thread_lock:
+            self._connection.execute("UPDATE trade_plans SET status = ? WHERE id = ?", (status, plan_id))
+            self._connection.commit()
+
+    async def record_trade_plan_event(self, plan_id: int, event_type: str, price: float | None, raw: dict) -> bool:
+        return await asyncio.to_thread(self._record_trade_plan_event_sync, plan_id, event_type, price, raw)
+
+    def _record_trade_plan_event_sync(self, plan_id: int, event_type: str, price: float | None, raw: dict) -> bool:
+        with self._thread_lock:
+            existing = self._connection.execute(
+                "SELECT id FROM trade_plan_events WHERE plan_id = ? AND event_type = ?",
+                (plan_id, event_type),
+            ).fetchone()
+            if existing is not None:
+                return False
+            self._connection.execute(
+                """
+                INSERT INTO trade_plan_events (plan_id, event_type, price, created_at, sent_to_telegram, raw_json)
+                VALUES (?, ?, ?, ?, 0, ?)
+                """,
+                (plan_id, event_type, price, self._now_iso(), json.dumps(raw)),
+            )
+            self._connection.commit()
+            return True
+
+    async def list_open_trade_plans(self) -> list[dict]:
+        statuses = ("CREATED", "ENTRY_TOUCHED", "ACTIVE_ASSUMED", "TP1_HIT", "TP2_HIT")
+        return await self.list_trade_plans(statuses=statuses)
