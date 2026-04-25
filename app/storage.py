@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -21,9 +22,27 @@ from app.models import (
     make_trade_key,
 )
 
+ACTIVE_TRADE_PLAN_STATUSES = (
+    "CREATED",
+    "ENTRY_TOUCHED",
+    "ACTIVE_ASSUMED",
+    "TP1_HIT",
+    "TP2_HIT",
+)
+
+TERMINAL_TRADE_PLAN_STATUSES = (
+    "TP3_HIT",
+    "SL_HIT",
+    "EXPIRED",
+    "CANCELLED",
+    "INVALIDATED",
+    "RESOLVED",
+)
+
 
 class Storage:
     def __init__(self, db_path: Path) -> None:
+        self._logger = logging.getLogger("trading_alert_bot.storage")
         self._db_path = db_path
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(self._db_path, check_same_thread=False)
@@ -163,9 +182,122 @@ class Storage:
                     closed_candle_time TEXT NOT NULL,
                     sent_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS trade_plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    signal_type TEXT NOT NULL,
+                    quality TEXT NOT NULL,
+                    entry_low REAL NOT NULL,
+                    entry_high REAL NOT NULL,
+                    stop_loss REAL NOT NULL,
+                    tp1 REAL NOT NULL,
+                    tp2 REAL NOT NULL,
+                    tp3 REAL NOT NULL,
+                    rr_tp1 REAL NOT NULL,
+                    rr_tp2 REAL NOT NULL,
+                    rr_tp3 REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    source_alert_id TEXT,
+                    plan_fingerprint TEXT,
+                    raw_json TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_trade_plans_symbol_status
+                ON trade_plans(symbol, status, created_at DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_plans_plan_fingerprint
+                ON trade_plans(plan_fingerprint);
+                CREATE TABLE IF NOT EXISTS trade_plan_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plan_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    price REAL,
+                    created_at TEXT NOT NULL,
+                    sent_to_telegram INTEGER NOT NULL DEFAULT 0,
+                    raw_json TEXT,
+                    UNIQUE(plan_id, event_type),
+                    FOREIGN KEY (plan_id) REFERENCES trade_plans(id) ON DELETE CASCADE
+                );
                 """
             )
+            columns = {
+                row["name"]
+                for row in self._connection.execute("PRAGMA table_info(trade_plans)").fetchall()
+            }
+            if "plan_fingerprint" not in columns:
+                self._connection.execute("ALTER TABLE trade_plans ADD COLUMN plan_fingerprint TEXT")
+                self._connection.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_plans_plan_fingerprint ON trade_plans(plan_fingerprint)"
+                )
+            try:
+                self._repair_duplicate_active_trade_plans_sync()
+                self._create_active_plan_unique_index_sync()
+            except Exception as exc:
+                self._logger.exception("failed_trade_plan_active_index_migration error=%s", exc)
+                self._connection.rollback()
+                raise
             self._connection.commit()
+
+    def _create_active_plan_unique_index_sync(self) -> None:
+        statuses_sql = ", ".join(f"'{status}'" for status in ACTIVE_TRADE_PLAN_STATUSES)
+        create_sql = (
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_plan_per_symbol_side "
+            "ON trade_plans(symbol, direction) "
+            f"WHERE status IN ({statuses_sql})"
+        )
+        try:
+            self._connection.execute("DROP INDEX IF EXISTS idx_one_active_plan_per_symbol_side")
+            self._connection.execute(create_sql)
+            self._logger.info("trade_plan_active_index_status index_created=%s", True)
+        except sqlite3.DatabaseError as exc:
+            self._logger.error("trade_plan_active_index_status index_created=%s error=%s", False, exc)
+            raise RuntimeError("failed_to_create_idx_one_active_plan_per_symbol_side") from exc
+
+    def _repair_duplicate_active_trade_plans_sync(self) -> None:
+        placeholders = ", ".join("?" for _ in ACTIVE_TRADE_PLAN_STATUSES)
+        duplicates = self._connection.execute(
+            f"""
+            SELECT symbol, direction, COUNT(*) AS total
+            FROM trade_plans
+            WHERE status IN ({placeholders})
+            GROUP BY symbol, direction
+            HAVING COUNT(*) > 1
+            """,
+            ACTIVE_TRADE_PLAN_STATUSES,
+        ).fetchall()
+        for row in duplicates:
+            symbol = str(row["symbol"])
+            direction = str(row["direction"])
+            plan_rows = self._connection.execute(
+                f"""
+                SELECT id
+                FROM trade_plans
+                WHERE symbol = ? AND direction = ? AND status IN ({placeholders})
+                ORDER BY datetime(created_at) DESC, id DESC
+                """,
+                (symbol, direction, *ACTIVE_TRADE_PLAN_STATUSES),
+            ).fetchall()
+            plan_ids = [int(plan["id"]) for plan in plan_rows]
+            if not plan_ids:
+                continue
+            kept_plan_id = plan_ids[0]
+            cancelled_plan_ids = plan_ids[1:]
+            if cancelled_plan_ids:
+                cancelled_placeholders = ", ".join("?" for _ in cancelled_plan_ids)
+                self._connection.execute(
+                    f"UPDATE trade_plans SET status = 'CANCELLED' WHERE id IN ({cancelled_placeholders})",
+                    tuple(cancelled_plan_ids),
+                )
+            self._logger.warning(
+                "duplicate_active_plans_detected symbol=%s direction=%s kept_plan_id=%s cancelled_plan_ids=%s",
+                symbol,
+                direction,
+                kept_plan_id,
+                cancelled_plan_ids,
+            )
 
     @staticmethod
     def _now_iso() -> str:
@@ -567,6 +699,10 @@ class Storage:
                 "DELETE FROM watchlist_symbols WHERE symbol = ?",
                 (normalized,),
             )
+            self._connection.execute(
+                "DELETE FROM scanner_alert_state WHERE symbol = ? AND level = 'ARMED_M15_SETUP'",
+                (normalized,),
+            )
             self._connection.commit()
         return cursor.rowcount > 0
 
@@ -578,6 +714,17 @@ class Storage:
             row = self._connection.execute(
                 "SELECT 1 FROM scanner_alert_state WHERE key = ? LIMIT 1",
                 (key,),
+            ).fetchone()
+        return row is not None
+
+    async def has_scanner_symbol_state(self, symbol: str) -> bool:
+        return await asyncio.to_thread(self._has_scanner_symbol_state_sync, symbol)
+
+    def _has_scanner_symbol_state_sync(self, symbol: str) -> bool:
+        with self._thread_lock:
+            row = self._connection.execute(
+                "SELECT 1 FROM scanner_alert_state WHERE symbol = ? LIMIT 1",
+                (symbol.upper(),),
             ).fetchone()
         return row is not None
 
@@ -628,6 +775,14 @@ class Storage:
                     self._now_iso(),
                 ),
             )
+            self._connection.commit()
+
+    async def delete_scanner_alert_state(self, key: str) -> None:
+        await asyncio.to_thread(self._delete_scanner_alert_state_sync, key)
+
+    def _delete_scanner_alert_state_sync(self, key: str) -> None:
+        with self._thread_lock:
+            self._connection.execute("DELETE FROM scanner_alert_state WHERE key = ?", (key,))
             self._connection.commit()
 
     async def set_trade_status(self, symbol: str, status: TradeStatus) -> TradeConfig:
@@ -971,3 +1126,128 @@ class Storage:
                 ),
             )
             self._connection.commit()
+
+    async def create_trade_plan(self, plan: dict) -> int:
+        return await asyncio.to_thread(self._create_trade_plan_sync, plan)
+
+    def _create_trade_plan_sync(self, plan: dict) -> int:
+        fingerprint = str(plan.get("plan_fingerprint", "") or "").strip()
+        if not fingerprint:
+            raise ValueError("missing_plan_fingerprint")
+        with self._thread_lock:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO trade_plans (
+                    symbol, direction, signal_type, quality,
+                    entry_low, entry_high, stop_loss, tp1, tp2, tp3,
+                    rr_tp1, rr_tp2, rr_tp3, status,
+                    created_at, expires_at, source_alert_id, plan_fingerprint, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    plan["symbol"],
+                    plan["direction"],
+                    plan["signal_type"],
+                    plan["quality"],
+                    float(plan["entry_zone_low"]),
+                    float(plan["entry_zone_high"]),
+                    float(plan["stop_loss"]),
+                    float(plan["tp1"]),
+                    float(plan["tp2"]),
+                    float(plan["tp3"]),
+                    float(plan["rr_tp1"]),
+                    float(plan["rr_tp2"]),
+                    float(plan["rr_tp3"]),
+                    plan.get("status", "CREATED"),
+                    plan["created_at"],
+                    plan["expires_at"],
+                    plan.get("source_alert_id"),
+                    fingerprint,
+                    json.dumps(plan),
+                ),
+            )
+            self._connection.commit()
+            return int(cursor.lastrowid)
+
+    async def has_trade_plan_fingerprint(self, fingerprint: str) -> bool:
+        return await asyncio.to_thread(self._has_trade_plan_fingerprint_sync, fingerprint)
+
+    def _has_trade_plan_fingerprint_sync(self, fingerprint: str) -> bool:
+        with self._thread_lock:
+            row = self._connection.execute(
+                "SELECT 1 FROM trade_plans WHERE plan_fingerprint = ? LIMIT 1",
+                (fingerprint,),
+            ).fetchone()
+        return row is not None
+
+    async def list_trade_plans(self, statuses: tuple[str, ...] | None = None) -> list[dict]:
+        return await asyncio.to_thread(self._list_trade_plans_sync, statuses)
+
+    def _list_trade_plans_sync(self, statuses: tuple[str, ...] | None = None) -> list[dict]:
+        with self._thread_lock:
+            query = "SELECT * FROM trade_plans"
+            params: tuple[object, ...] = ()
+            if statuses:
+                placeholders = ", ".join("?" for _ in statuses)
+                query += f" WHERE status IN ({placeholders})"
+                params = tuple(statuses)
+            query += " ORDER BY created_at DESC"
+            rows = self._connection.execute(query, params).fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_trade_plan(self, plan_id: int) -> dict | None:
+        return await asyncio.to_thread(self._get_trade_plan_sync, plan_id)
+
+    def _get_trade_plan_sync(self, plan_id: int) -> dict | None:
+        with self._thread_lock:
+            row = self._connection.execute("SELECT * FROM trade_plans WHERE id = ?", (plan_id,)).fetchone()
+            return dict(row) if row is not None else None
+
+    async def update_trade_plan_status(self, plan_id: int, status: str) -> None:
+        await asyncio.to_thread(self._update_trade_plan_status_sync, plan_id, status)
+
+    def _update_trade_plan_status_sync(self, plan_id: int, status: str) -> None:
+        with self._thread_lock:
+            self._connection.execute("UPDATE trade_plans SET status = ? WHERE id = ?", (status, plan_id))
+            self._connection.commit()
+
+    async def record_trade_plan_event(self, plan_id: int, event_type: str, price: float | None, raw: dict) -> bool:
+        return await asyncio.to_thread(self._record_trade_plan_event_sync, plan_id, event_type, price, raw)
+
+    def _record_trade_plan_event_sync(self, plan_id: int, event_type: str, price: float | None, raw: dict) -> bool:
+        with self._thread_lock:
+            existing = self._connection.execute(
+                "SELECT id FROM trade_plan_events WHERE plan_id = ? AND event_type = ?",
+                (plan_id, event_type),
+            ).fetchone()
+            if existing is not None:
+                return False
+            self._connection.execute(
+                """
+                INSERT INTO trade_plan_events (plan_id, event_type, price, created_at, sent_to_telegram, raw_json)
+                VALUES (?, ?, ?, ?, 0, ?)
+                """,
+                (plan_id, event_type, price, self._now_iso(), json.dumps(raw)),
+            )
+            self._connection.commit()
+            return True
+
+    async def list_open_trade_plans(self) -> list[dict]:
+        return await self.list_trade_plans(statuses=ACTIVE_TRADE_PLAN_STATUSES)
+
+    async def active_plan_exists(self, symbol: str, direction: str) -> bool:
+        return await asyncio.to_thread(self._active_plan_exists_sync, symbol, direction)
+
+    def _active_plan_exists_sync(self, symbol: str, direction: str) -> bool:
+        placeholders = ", ".join("?" for _ in ACTIVE_TRADE_PLAN_STATUSES)
+        with self._thread_lock:
+            row = self._connection.execute(
+                f"""
+                SELECT 1
+                FROM trade_plans
+                WHERE symbol = ? AND direction = ? AND status IN ({placeholders})
+                LIMIT 1
+                """,
+                (symbol.upper(), direction.upper(), *ACTIVE_TRADE_PLAN_STATUSES),
+            ).fetchone()
+        return row is not None
