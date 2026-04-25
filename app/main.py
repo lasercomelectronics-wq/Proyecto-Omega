@@ -681,6 +681,7 @@ class TradingAlertBot:
         )
         metadata["setup_status"] = "NOT_ARMED"
         metadata["plan_status"] = "PLAN_REJECTED"
+        metadata["armed_m15_setup_found"] = False
         if not isinstance(quality, dict) or not isinstance(structure, dict):
             metadata["plan_created"] = False
             metadata["plan_block_reason"] = "datos insuficientes"
@@ -727,6 +728,7 @@ class TradingAlertBot:
             armed_created_at = m15_open_int / 1000.0
             armed_expires_at = armed_created_at + (self.armed_m15_ttl_candles * self.armed_m15_tf_seconds)
             now_ts = time.time()
+            metadata["trigger_tf"] = source_tf
 
             if source_tf == "15m":
                 if side == "LONG":
@@ -765,6 +767,7 @@ class TradingAlertBot:
                     "m15_setup_created",
                 )
                 metadata["setup_status"] = "M15_SETUP_ARMED"
+                metadata["armed_m15_setup_found"] = True
                 if not self.enable_direct_m15_plans:
                     self.logger.info(
                         "m15 setup-only armed | reason=%s action=%s symbol=%s side=%s signal_type=%s source_tf=%s execution_tf=%s m15_candle_open_time=%s armed_key=%s armed_expires_at=%s",
@@ -784,18 +787,83 @@ class TradingAlertBot:
                     metadata["plan_block_reason"] = "armed_m15_setup_only"
                     return
             else:
-                metadata["plan_created"] = False
-                metadata["setup_status"] = "CONTEXT_ONLY"
-                metadata["plan_status"] = "CONTEXT_ONLY"
-                metadata["plan_block_reason"] = "non_execution_tf_blocked"
+                trigger_allowed = False
+                armed_setup_found = await self.storage.has_scanner_alert_state(arm_key)
+                metadata["armed_m15_setup_found"] = armed_setup_found
+                if source_tf not in {"1m", "3m", "5m"}:
+                    metadata["plan_created"] = False
+                    metadata["setup_status"] = "CONTEXT_ONLY"
+                    metadata["plan_status"] = "CONTEXT_ONLY"
+                    metadata["plan_block_reason"] = "non_execution_tf_without_armed_m15_setup"
+                    self.logger.info(
+                        "plan_gate source_tf=%s execution_tf=%s trigger_tf=%s armed_m15_setup_found=%s trigger_allowed=%s plan_block_reason=%s",
+                        source_tf,
+                        execution_tf,
+                        source_tf,
+                        armed_setup_found,
+                        trigger_allowed,
+                        metadata["plan_block_reason"],
+                    )
+                    return
+                if not armed_setup_found:
+                    metadata["plan_created"] = False
+                    metadata["setup_status"] = "CONTEXT_ONLY"
+                    metadata["plan_status"] = "CONTEXT_ONLY"
+                    metadata["plan_block_reason"] = "non_execution_tf_without_armed_m15_setup"
+                    self.logger.info(
+                        "plan_gate source_tf=%s execution_tf=%s trigger_tf=%s armed_m15_setup_found=%s trigger_allowed=%s plan_block_reason=%s",
+                        source_tf,
+                        execution_tf,
+                        source_tf,
+                        armed_setup_found,
+                        trigger_allowed,
+                        metadata["plan_block_reason"],
+                    )
+                    return
+                if not source_candle_closed:
+                    metadata["plan_created"] = False
+                    metadata["setup_status"] = "WAITING_TRIGGER"
+                    metadata["plan_status"] = "WAITING_TRIGGER"
+                    metadata["plan_block_reason"] = "source_candle_not_closed"
+                    self.logger.info(
+                        "plan_gate source_tf=%s execution_tf=%s trigger_tf=%s armed_m15_setup_found=%s trigger_allowed=%s plan_block_reason=%s",
+                        source_tf,
+                        execution_tf,
+                        source_tf,
+                        armed_setup_found,
+                        trigger_allowed,
+                        metadata["plan_block_reason"],
+                    )
+                    return
+                if now_ts > armed_expires_at:
+                    await self.storage.delete_scanner_alert_state(arm_key)
+                    metadata["plan_created"] = False
+                    metadata["setup_status"] = "CONTEXT_ONLY"
+                    metadata["plan_status"] = "PLAN_REJECTED"
+                    metadata["plan_block_reason"] = "armed_m15_expired"
+                    self.logger.info(
+                        "plan_gate source_tf=%s execution_tf=%s trigger_tf=%s armed_m15_setup_found=%s trigger_allowed=%s plan_block_reason=%s",
+                        source_tf,
+                        execution_tf,
+                        source_tf,
+                        armed_setup_found,
+                        trigger_allowed,
+                        metadata["plan_block_reason"],
+                    )
+                    return
+                trigger_allowed = True
+                metadata["setup_status"] = "WAITING_TRIGGER"
+                metadata["plan_status"] = "WAITING_TRIGGER"
+                metadata["armed_m15_setup_found"] = True
                 self.logger.info(
-                    "plan_gate_non_execution_tf_blocked symbol=%s source_tf=%s execution_tf=%s reason=%s",
-                    symbol,
+                    "plan_gate source_tf=%s execution_tf=%s trigger_tf=%s armed_m15_setup_found=%s trigger_allowed=%s plan_block_reason=%s",
                     source_tf,
                     execution_tf,
-                    "non_execution_tf_blocked",
+                    source_tf,
+                    armed_setup_found,
+                    trigger_allowed,
+                    "",
                 )
-                return
 
             if await self.storage.has_scanner_alert_state(f"planfp::{fingerprint}"):
                 metadata["plan_created"] = False
@@ -923,7 +991,7 @@ class TradingAlertBot:
                 quality.get("adx_human", {}).get("adx"),
                 metadata.get("context_quality"),
                 metadata.get("setup_status"),
-                True,
+                metadata.get("armed_m15_setup_found"),
                 source_tf,
                 source_tf == "15m",
                 metadata.get("plan_created", False),
