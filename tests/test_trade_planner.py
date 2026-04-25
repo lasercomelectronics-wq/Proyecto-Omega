@@ -16,6 +16,10 @@ def quality_payload(direction: str, signal_type: str, alert_allowed: bool = True
         "signal_type": signal_type,
         "quality": "ALTA",
         "alert_allowed": alert_allowed,
+        "ema_human": {
+            "close_vs_ema200": "ABOVE" if direction == "LONG" else "BELOW",
+            "ema55_vs_ema200": "ABOVE" if direction == "LONG" else "BELOW",
+        },
     }
 
 
@@ -50,7 +54,21 @@ def test_trade_plan_slots_serialization_to_dict() -> None:
     assert plan is not None
     payload = trade_plan_to_dict(plan)
     assert payload["symbol"] == "BTCUSDT"
+    assert payload["setup_type"] == "LONG_PIVOT_RETEST_M15"
+    assert payload["execution_tf"] == "15m"
     assert "tp1" in payload and "stop_loss" in payload
+
+
+def test_long_pivot_retest_requires_price_above_ema200() -> None:
+    payload = quality_payload("LONG", "LONG_PULLBACK")
+    payload["ema_human"]["close_vs_ema200"] = "BELOW"
+    plan = build_trade_plan(
+        symbol="BTCUSDT",
+        quality_payload=payload,
+        current_price=100.0,
+        structure_m15={"last_high": 102.0, "last_low": 98.0, "pullback": "LONG", "bias": "BULL", "bos": "BULL", "hl": True},
+    )
+    assert plan is None
 
 
 def test_no_plan_for_conflict_sin_senal_and_chase_default() -> None:

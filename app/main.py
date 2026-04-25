@@ -21,6 +21,7 @@ from app.storage import Storage, TERMINAL_TRADE_PLAN_STATUSES
 from app.strategy_engine import build_market_context
 from app.telegram_command_bot import TelegramCommandBot, TelegramCommandBotError
 from app.telegram_notifier import TelegramNotificationError, TelegramNotifier
+from app.timeframe import normalize_timeframe
 from app.plan_monitor import PlanMonitor
 from app.single_instance import SingleInstanceError, SingleInstanceLock
 from app.trade_planner import build_trade_plan, evaluate_plan_gate, trade_plan_to_dict
@@ -663,16 +664,23 @@ class TradingAlertBot:
         metadata = event.metadata or {}
         quality = metadata.get("quality_payload")
         structure = metadata.get("structure_m15")
-        source_tf = str(metadata.get("source_tf", metadata.get("trigger_tf", "unknown"))).lower()
-        execution_tf = str(metadata.get("execution_tf", "15m")).lower()
+        source_tf = normalize_timeframe(str(metadata.get("source_tf", metadata.get("trigger_tf", "unknown"))))
+        execution_tf = normalize_timeframe(str(metadata.get("execution_tf", "15m")))
         m15_candle_open_time = metadata.get("m15_candle_open_time")
         source_candle_closed = bool(metadata.get("source_candle_closed", metadata.get("is_closed_candle", False)))
         execution_candle_closed = bool(metadata.get("execution_candle_closed", metadata.get("is_closed_candle", False)))
         metadata["source_candle_closed"] = source_candle_closed
         metadata["execution_candle_closed"] = execution_candle_closed
+        metadata["source_tf"] = source_tf
+        metadata["execution_tf"] = execution_tf
         signal_type = str(metadata.get("signal_type", quality.get("signal_type") if isinstance(quality, dict) else "unknown"))
         side = str(metadata.get("direction", quality.get("result") if isinstance(quality, dict) else "unknown")).upper()
         symbol = event.symbol.upper()
+        metadata["context_quality"] = (
+            str(quality.get("quality", "BAJA")) if isinstance(quality, dict) else "BAJA"
+        )
+        metadata["setup_status"] = "NOT_ARMED"
+        metadata["plan_status"] = "PLAN_REJECTED"
         if not isinstance(quality, dict) or not isinstance(structure, dict):
             metadata["plan_created"] = False
             metadata["plan_block_reason"] = "datos insuficientes"
@@ -694,13 +702,21 @@ class TradingAlertBot:
 
         lock = self._get_plan_lock(symbol, side)
         async with lock:
-            fingerprint = f"{symbol}:{side}:{signal_type}:{execution_tf}:{m15_open_int}"
+            pivot_level = round(float(structure.get("broken_level") or structure.get("last_high") or 0.0), 4)
+            fingerprint = f"{symbol}:{side}:{signal_type}:{execution_tf}:{m15_open_int}:{pivot_level}"
             metadata["plan_fingerprint"] = fingerprint
             metadata["duplicate_suppressed"] = False
 
             if execution_tf != "15m":
                 metadata["plan_created"] = False
-                metadata["plan_block_reason"] = f"execution_tf_not_allowed:{execution_tf}"
+                metadata["plan_block_reason"] = "non_execution_tf_blocked"
+                self.logger.info(
+                    "plan_gate_non_execution_tf_blocked symbol=%s source_tf=%s execution_tf=%s reason=%s",
+                    symbol,
+                    source_tf,
+                    execution_tf,
+                    "non_execution_tf_blocked",
+                )
                 return
             if not execution_candle_closed:
                 metadata["plan_created"] = False
@@ -713,6 +729,24 @@ class TradingAlertBot:
             now_ts = time.time()
 
             if source_tf == "15m":
+                if side == "LONG":
+                    m15_operable = (
+                        str(structure.get("bos", "NONE")) == "BULL"
+                        and str(structure.get("pullback", "NONE")) == "LONG"
+                        and bool(structure.get("hl", False) or structure.get("pullback_clean", False))
+                    )
+                else:
+                    m15_operable = (
+                        str(structure.get("bos", "NONE")) == "BEAR"
+                        and str(structure.get("pullback", "NONE")) == "SHORT"
+                        and bool(structure.get("lh", False) or structure.get("pullback_clean", False))
+                    )
+                if not m15_operable:
+                    metadata["plan_created"] = False
+                    metadata["setup_status"] = "CONTEXT_ONLY"
+                    metadata["plan_status"] = "CONTEXT_ONLY"
+                    metadata["plan_block_reason"] = "missing_armed_m15_setup"
+                    return
                 await self.storage.record_scanner_alert_state(
                     key=arm_key,
                     symbol=symbol,
@@ -730,6 +764,7 @@ class TradingAlertBot:
                     "ARMED",
                     "m15_setup_created",
                 )
+                metadata["setup_status"] = "M15_SETUP_ARMED"
                 if not self.enable_direct_m15_plans:
                     self.logger.info(
                         "m15 setup-only armed | reason=%s action=%s symbol=%s side=%s signal_type=%s source_tf=%s execution_tf=%s m15_candle_open_time=%s armed_key=%s armed_expires_at=%s",
@@ -745,40 +780,33 @@ class TradingAlertBot:
                         armed_expires_at,
                     )
                     metadata["plan_created"] = False
+                    metadata["plan_status"] = "M15_SETUP_ARMED"
                     metadata["plan_block_reason"] = "armed_m15_setup_only"
                     return
             else:
-                if not source_candle_closed:
-                    metadata["plan_created"] = False
-                    metadata["plan_block_reason"] = "source_candle_not_closed"
-                    return
-                if not await self.storage.has_scanner_alert_state(arm_key):
-                    metadata["plan_created"] = False
-                    metadata["plan_block_reason"] = "missing_armed_m15_setup"
-                    return
-                if now_ts > armed_expires_at:
-                    await self.storage.delete_scanner_alert_state(arm_key)
-                    self.logger.info(
-                        "armed setup state | armed_key=%s armed_created_at=%s armed_expires_at=%s now=%s armed_status=%s reason=%s",
-                        arm_key,
-                        armed_created_at,
-                        armed_expires_at,
-                        now_ts,
-                        "EXPIRED",
-                        "armed_m15_expired",
-                    )
-                    metadata["plan_created"] = False
-                    metadata["plan_block_reason"] = "armed_m15_expired"
-                    return
+                metadata["plan_created"] = False
+                metadata["setup_status"] = "CONTEXT_ONLY"
+                metadata["plan_status"] = "CONTEXT_ONLY"
+                metadata["plan_block_reason"] = "non_execution_tf_blocked"
+                self.logger.info(
+                    "plan_gate_non_execution_tf_blocked symbol=%s source_tf=%s execution_tf=%s reason=%s",
+                    symbol,
+                    source_tf,
+                    execution_tf,
+                    "non_execution_tf_blocked",
+                )
+                return
 
             if await self.storage.has_scanner_alert_state(f"planfp::{fingerprint}"):
                 metadata["plan_created"] = False
                 metadata["duplicate_suppressed"] = True
+                metadata["plan_status"] = "PLAN_SUPPRESSED_DUPLICATE"
                 metadata["plan_block_reason"] = "duplicate_fingerprint"
                 return
 
             if await self.storage.active_plan_exists(symbol, side):
                 metadata["plan_created"] = False
+                metadata["plan_status"] = "PLAN_REJECTED"
                 metadata["plan_block_reason"] = "active_plan_exists"
                 return
 
@@ -802,6 +830,7 @@ class TradingAlertBot:
                     elapsed = self.plan_min_cooldown_seconds + 1
                 if elapsed < self.plan_min_cooldown_seconds and latest_status not in cooldown_allowed_statuses:
                     metadata["plan_created"] = False
+                    metadata["plan_status"] = "PLAN_REJECTED"
                     metadata["plan_block_reason"] = "cooldown_active"
                     return
 
@@ -813,6 +842,8 @@ class TradingAlertBot:
             metadata["auto_plan_allowed"] = allowed
             metadata["plan_block_reason"] = reason
             metadata["plan_created"] = False
+            metadata["setup_status"] = "WAITING_TRIGGER" if allowed else "CONTEXT_ONLY"
+            metadata["plan_status"] = "WAITING_TRIGGER" if allowed else "PLAN_REJECTED"
             if not allowed:
                 return
 
@@ -832,6 +863,8 @@ class TradingAlertBot:
             if plan_id is not None:
                 metadata["plan_created"] = True
                 metadata["plan_id"] = plan_id
+                metadata["setup_status"] = "PLAN_GENERATED"
+                metadata["plan_status"] = "PLAN_GENERATED"
                 metadata["plan_block_reason"] = "OK"
                 await self.storage.record_scanner_alert_state(
                     key=f"planfp::{fingerprint}",
@@ -871,8 +904,37 @@ class TradingAlertBot:
             if await self.storage.has_trade_plan_fingerprint(fingerprint):
                 metadata["plan_block_reason"] = "duplicate_fingerprint"
                 metadata["duplicate_suppressed"] = True
+                metadata["plan_status"] = "PLAN_SUPPRESSED_DUPLICATE"
             else:
                 metadata["plan_block_reason"] = "RR insuficiente / datos insuficientes / precio lejos de entrada ideal"
+            self.logger.info(
+                "plan_eval symbol=%s source_tf=%s execution_tf=%s signal_type=%s side=%s m15_trend=%s m15_bos=%s m15_pullback=%s higher_low=%s above_ema200=%s ema55_above_ema200=%s adx_value=%s context_quality=%s setup_status=%s armed_setup_found=%s trigger_tf=%s trigger_confirmed=%s plan_generated=%s plan_reject_reason=%s fingerprint=%s duplicate_suppressed=%s cooldown_blocked=%s active_plan_blocked=%s candle_open_time=%s candle_closed=%s",
+                symbol,
+                source_tf,
+                execution_tf,
+                signal_type,
+                side,
+                structure.get("bias"),
+                structure.get("bos"),
+                structure.get("pullback"),
+                structure.get("hl"),
+                quality.get("ema_human", {}).get("close_vs_ema200") == "ABOVE",
+                quality.get("ema_human", {}).get("ema55_vs_ema200") == "ABOVE",
+                quality.get("adx_human", {}).get("adx"),
+                metadata.get("context_quality"),
+                metadata.get("setup_status"),
+                True,
+                source_tf,
+                source_tf == "15m",
+                metadata.get("plan_created", False),
+                metadata.get("plan_block_reason"),
+                fingerprint,
+                metadata.get("duplicate_suppressed", False),
+                metadata.get("plan_block_reason") == "cooldown_active",
+                metadata.get("plan_block_reason") == "active_plan_exists",
+                m15_open_int,
+                execution_candle_closed,
+            )
 
 
 async def async_main() -> None:

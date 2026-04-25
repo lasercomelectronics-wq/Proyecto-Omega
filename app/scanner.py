@@ -18,6 +18,7 @@ from app.strategy_engine import (
     evaluate_signal_quality,
 )
 from app.structure import analyze_structure
+from app.timeframe import normalize_timeframe
 from app.trade_manager import TradeManager
 
 DispatchAlerts = Callable[[list[AlertEvent]], Awaitable[int]]
@@ -313,13 +314,17 @@ class SignalScanner:
         if not bool(metadata.get("scanner", False)):
             return
         lines = [event.note or ""]
+        plan_status = str(metadata.get("plan_status", "PLAN_REJECTED"))
+        context_quality = str(metadata.get("context_quality", metadata.get("quality_payload", {}).get("quality", "BAJA")))
+        setup_status = str(metadata.get("setup_status", "NOT_ARMED"))
         if metadata.get("plan_created") and metadata.get("plan_id") is not None:
             plan = metadata.get("plan_payload") or {}
             lines.extend(
                 [
                     "",
-                    "🧭 Plan sugerido:",
+                    "🟢 Plan generado:",
                     f"Plan ID: #{metadata.get('plan_id')}",
+                    f"Estado: {plan_status}",
                     f"Entrada: {float(plan.get('entry_low', 0.0)):.6f} - {float(plan.get('entry_high', 0.0)):.6f}",
                     f"SL: {float(plan.get('stop_loss', 0.0)):.6f}",
                     f"TP1: {float(plan.get('tp1', 0.0)):.6f} | {float(plan.get('rr_tp1', 0.0)):.2f}R",
@@ -329,11 +334,15 @@ class SignalScanner:
             )
             metadata["template_used"] = "SIGNAL_WITH_PLAN"
         else:
+            prefix = "🟡 Contexto solamente:" if setup_status in {"CONTEXT_ONLY", "NOT_ARMED"} else "🟠 Setup armado:"
             lines.extend(
                 [
                     "",
-                    "🧭 Plan:",
-                    "No generado.",
+                    prefix,
+                    f"Contexto: {context_quality}",
+                    f"Setup: {setup_status}",
+                    f"Plan status: {plan_status}",
+                    "Plan: No generado.",
                     f"Motivo: {metadata.get('plan_block_reason', 'datos insuficientes')}",
                 ]
             )
@@ -415,8 +424,9 @@ class SignalScanner:
                 koncorde_m15 = analyze_koncorde_lite(candles)
             if self._structure_enabled and interval in self._structure_timeframes:
                 try:
+                    closed_candles = self._closed_candles_only(candles)
                     structure_by_tf[interval] = analyze_structure(
-                        candles[:-1],
+                        closed_candles,
                         pivot_window=self._pivot_window,
                         pullback_tolerance_mode=self._pullback_tolerance_mode,
                         pullback_atr_mult=self._pullback_atr_mult,
@@ -471,6 +481,11 @@ class SignalScanner:
             return []
 
         full_sync = tf_directions["1m"] == result
+        m15_closed = self._last_closed_candle(candles_by_tf["15m"])
+        m5_closed = self._last_closed_candle(candles_by_tf["5m"])
+        m1_closed = self._last_closed_candle(candles_by_tf["1m"])
+        if m15_closed is None or m5_closed is None or m1_closed is None:
+            return []
         if full_sync:
             signals.append(
                 self._build_signal(
@@ -478,13 +493,13 @@ class SignalScanner:
                     direction=result,
                     level="FULL_4_4",
                     trigger_tf="1m",
-                    closed_candle_time=candles_by_tf["1m"][-2].close_time,
+                    closed_candle_time=m1_closed.close_time,
                     tf_rows=tf_rows,
                     m15_ema=m15_ema,
                     koncorde_m15=koncorde_m15,
                     quality=quality,
                     structure_m15=structure_by_tf.get("15m", {}),
-                    m15_candle_open_time=candles_by_tf["15m"][-2].open_time,
+                    m15_candle_open_time=m15_closed.open_time,
                     is_closed_candle=True,
                 )
             )
@@ -495,13 +510,13 @@ class SignalScanner:
                     direction=result,
                     level="SYNC_3_4",
                     trigger_tf="5m",
-                    closed_candle_time=candles_by_tf["5m"][-2].close_time,
+                    closed_candle_time=m5_closed.close_time,
                     tf_rows=tf_rows,
                     m15_ema=m15_ema,
                     koncorde_m15=koncorde_m15,
                     quality=quality,
                     structure_m15=structure_by_tf.get("15m", {}),
-                    m15_candle_open_time=candles_by_tf["15m"][-2].open_time,
+                    m15_candle_open_time=m15_closed.open_time,
                     is_closed_candle=True,
                 )
             )
@@ -529,6 +544,9 @@ class SignalScanner:
         signals: list[ScannerSignal],
     ) -> list[ScannerSignal]:
         cross = str(m15_ema["cross"])
+        m15_closed = self._last_closed_candle(candles_by_tf["15m"])
+        if m15_closed is None:
+            return signals
         if cross == "bull_cross":
             signals.append(
                 self._build_signal(
@@ -536,13 +554,13 @@ class SignalScanner:
                     direction="LONG",
                     level="EMA_CROSS_M15",
                     trigger_tf="15m",
-                    closed_candle_time=candles_by_tf["15m"][-2].close_time,
+                    closed_candle_time=m15_closed.close_time,
                     tf_rows=tf_rows,
                     m15_ema=m15_ema,
                     koncorde_m15=koncorde_m15,
                     quality=quality,
                     structure_m15=structure_m15,
-                    m15_candle_open_time=candles_by_tf["15m"][-2].open_time,
+                    m15_candle_open_time=m15_closed.open_time,
                     is_closed_candle=True,
                 )
             )
@@ -553,13 +571,13 @@ class SignalScanner:
                     direction="SHORT",
                     level="EMA_CROSS_M15",
                     trigger_tf="15m",
-                    closed_candle_time=candles_by_tf["15m"][-2].close_time,
+                    closed_candle_time=m15_closed.close_time,
                     tf_rows=tf_rows,
                     m15_ema=m15_ema,
                     koncorde_m15=koncorde_m15,
                     quality=quality,
                     structure_m15=structure_m15,
-                    m15_candle_open_time=candles_by_tf["15m"][-2].open_time,
+                    m15_candle_open_time=m15_closed.open_time,
                     is_closed_candle=True,
                 )
             )
@@ -582,6 +600,7 @@ class SignalScanner:
         is_closed_candle: bool,
     ) -> ScannerSignal:
         side = TradeSide.LONG if direction == "LONG" else TradeSide.SHORT
+        trigger_tf = normalize_timeframe(trigger_tf)
         header_icon = "🟢" if direction == "LONG" else "🔴"
         signal_type = str(quality.get("signal_type", f"{direction}_CONTINUATION"))
         level_text = {
@@ -653,3 +672,16 @@ class SignalScanner:
             trigger_tf=trigger_tf,
             closed_candle_time=closed_candle_time,
         )
+
+    @staticmethod
+    def _closed_candles_only(candles: list[Candle]) -> list[Candle]:
+        if len(candles) <= 1:
+            return []
+        return candles[:-1]
+
+    @staticmethod
+    def _last_closed_candle(candles: list[Candle]) -> Candle | None:
+        closed = SignalScanner._closed_candles_only(candles)
+        if not closed:
+            return None
+        return closed[-1]

@@ -8,7 +8,6 @@ import pytest
 from app.main import TradingAlertBot
 from app.models import AlertEvent, AlertPriority, TradeSide
 from app.storage import Storage
-from app.trade_planner import build_trade_plan
 
 
 def run(coro):
@@ -22,6 +21,10 @@ def _quality(direction: str = "LONG", signal_type: str = "LONG_PULLBACK") -> dic
         "quality": "ALTA",
         "adx_human": {"state": "ADX_OK"},
         "koncorde_human": {"state": "LONG_OK" if direction == "LONG" else "SHORT_OK"},
+        "ema_human": {
+            "close_vs_ema200": "ABOVE" if direction == "LONG" else "BELOW",
+            "ema55_vs_ema200": "ABOVE" if direction == "LONG" else "BELOW",
+        },
         "result": direction,
     }
 
@@ -32,6 +35,9 @@ def _structure(direction: str = "LONG") -> dict:
         "bos": "BULL" if direction == "LONG" else "BEAR",
         "last_high": 105.0,
         "last_low": 95.0,
+        "hl": direction == "LONG",
+        "lh": direction == "SHORT",
+        "pullback_clean": True,
     }
 
 
@@ -89,22 +95,22 @@ def _arm_key(symbol: str, side: str, signal_type: str, m15_open: int) -> str:
     return f"armed_m15::{symbol}:{side}:{signal_type}:{m15_open}"
 
 
-def test_armed_m15_expired_trigger_m1_no_plan(tmp_path: Path) -> None:
+def test_m1_events_are_context_only_without_plan_authority(tmp_path: Path) -> None:
     async def scenario() -> None:
         bot, storage = await _build_bot(tmp_path)
         try:
-            old_open = int((datetime.now(tz=timezone.utc) - timedelta(hours=2)).timestamp() * 1000)
-            await storage.record_scanner_alert_state(
-                key=_arm_key("BTCUSDT", "LONG", "LONG_PULLBACK", old_open),
-                symbol="BTCUSDT",
-                direction="LONG",
-                level="ARMED_M15_SETUP",
-                trigger_tf="15m",
-                closed_candle_time=str(old_open),
-            )
-            event = _event(source_tf="1m", execution_tf="15m", m15_open=old_open, source_closed=True, execution_closed=True, key_suffix="exp")
-            await bot.handle_scanner_signal_sent(event)
-            assert event.metadata.get("plan_block_reason") == "armed_m15_expired"
+            now_open = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+            for index in range(20):
+                event = _event(
+                    source_tf="1m",
+                    execution_tf="15m",
+                    m15_open=now_open,
+                    source_closed=True,
+                    execution_closed=True,
+                    key_suffix=f"m1-{index}",
+                )
+                await bot.handle_scanner_signal_sent(event)
+                assert event.metadata.get("plan_block_reason") == "non_execution_tf_blocked"
             assert await storage.list_trade_plans() == []
         finally:
             await storage.close()
@@ -112,7 +118,7 @@ def test_armed_m15_expired_trigger_m1_no_plan(tmp_path: Path) -> None:
     run(scenario())
 
 
-def test_armed_m15_valid_trigger_m1_closed_creates_one(tmp_path: Path) -> None:
+def test_non_m15_source_tf_is_blocked_even_if_setup_exists(tmp_path: Path) -> None:
     async def scenario() -> None:
         bot, storage = await _build_bot(tmp_path)
         try:
@@ -125,32 +131,31 @@ def test_armed_m15_valid_trigger_m1_closed_creates_one(tmp_path: Path) -> None:
                 trigger_tf="15m",
                 closed_candle_time=str(now_open),
             )
-            await bot.handle_scanner_signal_sent(
-                _event(source_tf="1m", execution_tf="15m", m15_open=now_open, source_closed=True, execution_closed=True, key_suffix="ok")
+            event = _event(
+                source_tf="1m",
+                execution_tf="15m",
+                m15_open=now_open,
+                source_closed=True,
+                execution_closed=True,
+                key_suffix="ok",
             )
-            assert len(await storage.list_trade_plans()) == 1
+            await bot.handle_scanner_signal_sent(event)
+            assert event.metadata.get("plan_block_reason") == "non_execution_tf_blocked"
+            assert len(await storage.list_trade_plans()) == 0
         finally:
             await storage.close()
 
     run(scenario())
 
 
-def test_armed_m15_valid_trigger_m1_open_source_no_plan(tmp_path: Path) -> None:
+def test_execution_candle_open_does_not_create_plan(tmp_path: Path) -> None:
     async def scenario() -> None:
-        bot, storage = await _build_bot(tmp_path)
+        bot, storage = await _build_bot(tmp_path, enable_direct_m15_plans=True)
         try:
             now_open = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
-            await storage.record_scanner_alert_state(
-                key=_arm_key("BTCUSDT", "LONG", "LONG_PULLBACK", now_open),
-                symbol="BTCUSDT",
-                direction="LONG",
-                level="ARMED_M15_SETUP",
-                trigger_tf="15m",
-                closed_candle_time=str(now_open),
-            )
-            event = _event(source_tf="1m", execution_tf="15m", m15_open=now_open, source_closed=False, execution_closed=True, key_suffix="open")
+            event = _event(source_tf="15m", execution_tf="15m", m15_open=now_open, source_closed=True, execution_closed=False, key_suffix="open")
             await bot.handle_scanner_signal_sent(event)
-            assert event.metadata.get("plan_block_reason") == "source_candle_not_closed"
+            assert event.metadata.get("plan_block_reason") == "m15_open_candle"
             assert len(await storage.list_trade_plans()) == 0
         finally:
             await storage.close()
@@ -191,6 +196,55 @@ def test_m15_closed_direct_enabled_can_create_plan(tmp_path: Path) -> None:
     run(scenario())
 
 
+def test_m15_context_without_bos_pullback_is_context_only(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        bot, storage = await _build_bot(tmp_path, enable_direct_m15_plans=True)
+        try:
+            m15_open = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+            event = _event(
+                source_tf="15m",
+                execution_tf="15m",
+                m15_open=m15_open,
+                source_closed=True,
+                execution_closed=True,
+                key_suffix="ctx-only",
+            )
+            event.metadata["structure_m15"]["bos"] = "NONE"
+            event.metadata["structure_m15"]["pullback"] = "NONE"
+            await bot.handle_scanner_signal_sent(event)
+            assert event.metadata.get("plan_created") is False
+            assert event.metadata.get("plan_block_reason") == "missing_armed_m15_setup"
+            assert event.metadata.get("plan_status") == "CONTEXT_ONLY"
+            assert len(await storage.list_trade_plans()) == 0
+        finally:
+            await storage.close()
+
+    run(scenario())
+
+
+def test_timeframe_normalization_accepts_uppercase_m15(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        bot, storage = await _build_bot(tmp_path, enable_direct_m15_plans=True)
+        try:
+            m15_open = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+            event = _event(
+                source_tf="M15",
+                execution_tf="M15",
+                m15_open=m15_open,
+                source_closed=True,
+                execution_closed=True,
+                key_suffix="m15-upper",
+            )
+            await bot.handle_scanner_signal_sent(event)
+            assert event.metadata.get("source_tf") == "15m"
+            assert event.metadata.get("execution_tf") == "15m"
+            assert len(await storage.list_trade_plans()) == 1
+        finally:
+            await storage.close()
+
+    run(scenario())
+
+
 def test_trigger_after_ttl_no_plan(tmp_path: Path) -> None:
     async def scenario() -> None:
         bot, storage = await _build_bot(tmp_path)
@@ -204,9 +258,9 @@ def test_trigger_after_ttl_no_plan(tmp_path: Path) -> None:
                 trigger_tf="15m",
                 closed_candle_time=str(m15_open),
             )
-            await bot.handle_scanner_signal_sent(
-                _event(source_tf="1m", execution_tf="15m", m15_open=m15_open, source_closed=True, execution_closed=True, key_suffix="ttl")
-            )
+            event = _event(source_tf="1m", execution_tf="15m", m15_open=m15_open, source_closed=True, execution_closed=True, key_suffix="ttl")
+            await bot.handle_scanner_signal_sent(event)
+            assert event.metadata.get("plan_block_reason") == "non_execution_tf_blocked"
             assert len(await storage.list_trade_plans()) == 0
         finally:
             await storage.close()
@@ -472,7 +526,7 @@ def test_recovery_same_signal_not_duplicated(tmp_path: Path) -> None:
     run(scenario())
 
 
-def test_trigger_m1_does_not_modify_structural_tp_sl(tmp_path: Path) -> None:
+def test_trigger_m1_cannot_create_plan_even_with_armed_setup(tmp_path: Path) -> None:
     async def scenario() -> None:
         bot, storage = await _build_bot(tmp_path, enable_direct_m15_plans=False)
         try:
@@ -480,23 +534,11 @@ def test_trigger_m1_does_not_modify_structural_tp_sl(tmp_path: Path) -> None:
             await bot.handle_scanner_signal_sent(
                 _event(source_tf="15m", execution_tf="15m", m15_open=m15_open, source_closed=True, execution_closed=True, key_suffix="setup")
             )
-            await bot.handle_scanner_signal_sent(
-                _event(source_tf="1m", execution_tf="15m", m15_open=m15_open, source_closed=True, execution_closed=True, key_suffix="trigger")
-            )
+            trigger = _event(source_tf="1m", execution_tf="15m", m15_open=m15_open, source_closed=True, execution_closed=True, key_suffix="trigger")
+            await bot.handle_scanner_signal_sent(trigger)
             plans = await storage.list_trade_plans()
-            assert len(plans) == 1
-            plan = plans[0]
-            expected = build_trade_plan(
-                symbol="BTCUSDT",
-                quality_payload=_quality("LONG", "LONG_PULLBACK"),
-                current_price=100.0,
-                structure_m15=_structure("LONG"),
-            )
-            assert expected is not None
-            assert float(plan["stop_loss"]) == pytest.approx(expected.stop_loss)
-            assert float(plan["tp1"]) == pytest.approx(expected.tp1)
-            assert float(plan["tp2"]) == pytest.approx(expected.tp2)
-            assert float(plan["tp3"]) == pytest.approx(expected.tp3)
+            assert len(plans) == 0
+            assert trigger.metadata.get("plan_block_reason") == "non_execution_tf_blocked"
         finally:
             await storage.close()
 

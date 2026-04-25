@@ -52,6 +52,9 @@ class TradePlan:
     symbol: str
     direction: str
     signal_type: str
+    setup_type: str
+    execution_tf: str
+    trigger_tf: str
     quality: str
     current_price: float
     entry_zone_low: float
@@ -63,6 +66,8 @@ class TradePlan:
     rr_tp1: float
     rr_tp2: float
     rr_tp3: float
+    entry_price: float
+    invalidation_reason: str
     reasons: list[str]
     warnings: list[str]
     created_at: str
@@ -88,6 +93,9 @@ def trade_plan_to_dict(plan: Any) -> dict[str, Any]:
         "symbol",
         "direction",
         "signal_type",
+        "setup_type",
+        "execution_tf",
+        "trigger_tf",
         "quality",
         "current_price",
         "entry_zone_low",
@@ -99,6 +107,8 @@ def trade_plan_to_dict(plan: Any) -> dict[str, Any]:
         "rr_tp1",
         "rr_tp2",
         "rr_tp3",
+        "entry_price",
+        "invalidation_reason",
         "reasons",
         "warnings",
         "created_at",
@@ -193,6 +203,20 @@ def build_trade_plan(
     if direction not in {"LONG", "SHORT"}:
         return None
 
+    ema_human = quality_payload.get("ema_human", {})
+    above_ema200 = str(ema_human.get("close_vs_ema200", "UNKNOWN")) == "ABOVE"
+    ema55_above_ema200 = str(ema_human.get("ema55_vs_ema200", "UNKNOWN")) == "ABOVE"
+    has_bos_bull = str(structure_m15.get("bos", "NONE")) == "BULL"
+    has_pullback_long = str(structure_m15.get("pullback", "NONE")) == "LONG"
+    has_higher_low = bool(structure_m15.get("hl", False))
+
+    setup_type = signal_type
+    if direction == "LONG":
+        if not above_ema200:
+            return None
+        if has_bos_bull and has_pullback_long and (has_higher_low or ema55_above_ema200):
+            setup_type = "LONG_PIVOT_RETEST_M15"
+
     swing_high = float(structure_m15.get("last_high") or current_price * 1.01)
     swing_low = float(structure_m15.get("last_low") or current_price * 0.99)
     if swing_high <= swing_low:
@@ -222,9 +246,15 @@ def build_trade_plan(
 
     atr = atr_value if atr_value is not None else (abs(swing_high - swing_low) * 0.2)
     buffer = max(atr * atr_buffer_mult, current_price * 0.001)
+    broken_level = float(structure_m15.get("broken_level") or (swing_high if direction == "LONG" else swing_low))
+    pivot_zone_low = broken_level - (atr * 0.25)
+    pivot_zone_high = broken_level + (atr * 0.25)
 
     if direction == "LONG":
-        stop_loss = (ob["low"] if ob else swing_low) - buffer
+        if setup_type == "LONG_PIVOT_RETEST_M15":
+            entry_zone_low = min(entry_zone_low, pivot_zone_low)
+            entry_zone_high = max(entry_zone_high, pivot_zone_high)
+        stop_loss = min((ob["low"] if ob else swing_low), entry_zone_low) - buffer
         risk = max(1e-9, ((entry_zone_low + entry_zone_high) / 2) - stop_loss)
         tp1 = max(((entry_zone_low + entry_zone_high) / 2) + risk, swing_high)
         tp2 = max(((entry_zone_low + entry_zone_high) / 2) + (risk * 2), ext["1.272"])
@@ -258,10 +288,14 @@ def build_trade_plan(
         warnings.append("reversal temprano: requiere confirmación")
 
     now = datetime.now(tz=timezone.utc)
+    entry_mid = (entry_zone_low + entry_zone_high) / 2
     return TradePlan(
         symbol=symbol,
         direction=direction,
         signal_type=signal_type,
+        setup_type=setup_type,
+        execution_tf="15m",
+        trigger_tf="15m",
         quality=str(quality_payload.get("quality", "BAJA")),
         current_price=float(current_price),
         entry_zone_low=float(entry_zone_low),
@@ -273,6 +307,8 @@ def build_trade_plan(
         rr_tp1=float(rr_tp1),
         rr_tp2=float(rr_tp2),
         rr_tp3=float(rr_tp3),
+        entry_price=float(entry_mid),
+        invalidation_reason="loss_of_m15_structure",
         reasons=reasons,
         warnings=warnings,
         created_at=now.isoformat(),

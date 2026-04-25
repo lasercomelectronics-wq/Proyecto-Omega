@@ -69,6 +69,40 @@ def detect_confirmed_pivots(candles: list[Candle], pivot_window: int = 3) -> dic
     return {"highs": pivot_highs, "lows": pivot_lows}
 
 
+def detect_swing_high(candles: list[Candle], left: int = 2, right: int = 2) -> dict[str, float | int] | None:
+    pivots = detect_confirmed_pivots(candles, pivot_window=max(left, right))
+    if not pivots["highs"]:
+        return None
+    return pivots["highs"][-1]
+
+
+def detect_swing_low(candles: list[Candle], left: int = 2, right: int = 2) -> dict[str, float | int] | None:
+    pivots = detect_confirmed_pivots(candles, pivot_window=max(left, right))
+    if not pivots["lows"]:
+        return None
+    return pivots["lows"][-1]
+
+
+def detect_bos_bullish(candles: list[Candle], pivot_window: int = 3) -> bool:
+    analysis = analyze_structure(candles, pivot_window=pivot_window)
+    return str(analysis.get("bos", "NONE")) == "BULL"
+
+
+def detect_bos_bearish(candles: list[Candle], pivot_window: int = 3) -> bool:
+    analysis = analyze_structure(candles, pivot_window=pivot_window)
+    return str(analysis.get("bos", "NONE")) == "BEAR"
+
+
+def detect_higher_low(candles: list[Candle], pivot_window: int = 3) -> bool:
+    analysis = analyze_structure(candles, pivot_window=pivot_window)
+    return bool(analysis.get("hl", False))
+
+
+def detect_lower_high(candles: list[Candle], pivot_window: int = 3) -> bool:
+    analysis = analyze_structure(candles, pivot_window=pivot_window)
+    return bool(analysis.get("lh", False))
+
+
 def _structure_flags(pivot_highs: list[dict[str, float | int]], pivot_lows: list[dict[str, float | int]]) -> dict[str, Any]:
     last_high = float(pivot_highs[-1]["price"]) if pivot_highs else None
     prev_high = float(pivot_highs[-2]["price"]) if len(pivot_highs) >= 2 else None

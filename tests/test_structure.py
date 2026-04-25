@@ -1,5 +1,13 @@
 from app.models import Candle
-from app.structure import analyze_structure, detect_confirmed_pivots
+from app.structure import (
+    analyze_structure,
+    detect_bos_bullish,
+    detect_confirmed_pivots,
+    detect_higher_low,
+    detect_lower_high,
+    detect_swing_high,
+    detect_swing_low,
+)
 
 
 def _make_candles(closes: list[float]) -> list[Candle]:
@@ -34,3 +42,14 @@ def test_analyze_structure_returns_bias_flags() -> None:
     assert result["bos"] in {"BULL", "BEAR", "NONE"}
     assert result["choch"] in {"BULL", "BEAR", "NONE"}
     assert result["pullback"] in {"LONG", "SHORT", "NONE"}
+
+
+def test_structure_helper_functions() -> None:
+    candles = _make_candles([1.00, 1.20, 1.40, 1.15, 1.35, 1.55, 1.30, 1.50, 1.70, 1.60, 1.65])
+    swing_high = detect_swing_high(candles, left=2, right=2)
+    swing_low = detect_swing_low(candles, left=2, right=2)
+    assert swing_high is None or "price" in swing_high
+    assert swing_low is None or "price" in swing_low
+    assert isinstance(detect_bos_bullish(candles, pivot_window=2), bool)
+    assert isinstance(detect_higher_low(candles, pivot_window=2), bool)
+    assert isinstance(detect_lower_high(candles, pivot_window=2), bool)
