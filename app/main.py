@@ -957,16 +957,17 @@ class TradingAlertBot:
                             "rr_tp2": float(plan["rr_tp2"]),
                             "rr_tp3": float(plan["rr_tp3"]),
                         }
-                await self._dispatch_alerts(
-                    [
-                        self.alert_engine.build_system_alert(
-                            key=f"plan_created_{event.symbol.lower()}_{plan_id}",
-                            reason=f"Plan sugerido creado para {event.symbol} (#{plan_id}).",
-                            priority=AlertPriority.INFO,
-                            note=event.note,
-                        )
-                    ]
-                )
+                if self.alert_engine is not None:
+                    await self._dispatch_alerts(
+                        [
+                            self.alert_engine.build_system_alert(
+                                key=f"plan_created_{event.symbol.lower()}_{plan_id}",
+                                reason=f"Plan sugerido creado para {event.symbol} (#{plan_id}).",
+                                priority=AlertPriority.INFO,
+                                note=event.note,
+                            )
+                        ]
+                    )
                 return
 
             if await self.storage.has_trade_plan_fingerprint(fingerprint):

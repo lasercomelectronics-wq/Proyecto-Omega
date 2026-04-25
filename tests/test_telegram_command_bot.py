@@ -116,6 +116,7 @@ async def build_bot(
         current_price_provider=current_price_provider,
         sender=sender,
         binance_status_provider=binance_status_provider,
+        storage=storage,
     )
     return bot, trade_manager, storage, sent_messages
 

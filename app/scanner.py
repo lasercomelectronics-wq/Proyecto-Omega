@@ -424,9 +424,8 @@ class SignalScanner:
                 koncorde_m15 = analyze_koncorde_lite(candles)
             if self._structure_enabled and interval in self._structure_timeframes:
                 try:
-                    closed_candles = self._closed_candles_only(candles)
                     structure_by_tf[interval] = analyze_structure(
-                        closed_candles,
+                        candles,
                         pivot_window=self._pivot_window,
                         pullback_tolerance_mode=self._pullback_tolerance_mode,
                         pullback_atr_mult=self._pullback_atr_mult,
